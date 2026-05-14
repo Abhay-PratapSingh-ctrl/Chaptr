@@ -1,0 +1,10 @@
+{
+  "devDependencies": {
+    "babel-plugin-transform-import-meta": "^2.3.3"
+  },
+  "dependencies": {
+    "@mysten/sui": "^1.45.2",
+    "@mysten/zklogin": "^0.8.1",
+    "jwt-decode": "^4.0.0"
+  }
+}
