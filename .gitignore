@@ -9,3 +9,8 @@ npm-debug.*
 *.mobileprovision
 *.orig.*
 mesa_core.log
+
+# Move build artifacts
+chaptr/build/
+sui-contracts/build/
+*.lock
