@@ -10,7 +10,20 @@ npm-debug.*
 *.orig.*
 mesa_core.log
 
+# Secrets and local env
+.env
+.env.*
+!.env.example
+
+# Sui CLI binaries (local tooling, not source)
+sui-contracts/
+
 # Move build artifacts
 chaptr/build/
-sui-contracts/build/
 *.lock
+
+# Local dev / zkLogin test scripts
+ai-concierge/get_epoch.js
+ai-concierge/test_*.js
+ai-concierge/test_*.ts
+chaptr/Published.old.toml
