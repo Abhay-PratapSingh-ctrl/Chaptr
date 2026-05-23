@@ -1,7 +1,7 @@
 import { Transaction } from '@mysten/sui/transactions';
 
 // This is the Package ID of your freshly published chaptr smart contract!
-const PACKAGE_ID = '0x39d941cfafec6d528c50300fc71d60af3bc9c0d890596bbe998644382357c8c9';
+const PACKAGE_ID = process.env.EXPO_PUBLIC_PACKAGE_ID || '';
 
 /**
  * Creates the transaction block to mint a new Digital Twin agent.

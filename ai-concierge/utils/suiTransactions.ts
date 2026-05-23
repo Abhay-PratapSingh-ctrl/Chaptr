@@ -1,43 +1,94 @@
-// utils/suiTransactions.ts
-import { SuiClient, getFullnodeUrl } from '@mysten/sui/client';
 import { Transaction } from '@mysten/sui/transactions';
 
-const client = new SuiClient({ url: getFullnodeUrl('testnet') });
+const PACKAGE_ID = process.env.EXPO_PUBLIC_PACKAGE_ID || '';
 
-const PACKAGE_ID = 'YOUR_DEPLOYED_PACKAGE_ID'; // after sui client publish
+type SignAndExecute = (args: { transaction: Transaction }) => Promise<any>;
 
-export const mintDigitalTwin = async (
-  blobId: string,
-  signAndExecute: Function  // from @mysten/dapp-kit or your wallet adapter
-) => {
+const clampProposalScore = (score: number) =>
+  Math.max(70, Math.min(99, Math.round(Number.isFinite(score) ? score : 86)));
+
+export const buildMintAgentTx = (vectorRef: string) => {
   const tx = new Transaction();
 
   tx.moveCall({
     target: `${PACKAGE_ID}::agent::mint_agent`,
-    arguments: [tx.pure.string(blobId)],
+    arguments: [tx.pure.string(vectorRef)],
   });
 
-  return await signAndExecute({ transaction: tx });
+  return tx;
 };
 
-export const proposeSuiMatch = async (
-  targetAddress: string,
+export const mintDigitalTwin = async (
   blobId: string,
+  signAndExecute: SignAndExecute,
+) => {
+  return signAndExecute({
+    transaction: buildMintAgentTx(blobId),
+  });
+};
+
+export const buildProposeMatchTx = (
+  myTwinId: string,
+  targetAddress: string,
   score: number,
   message: string,
-  signAndExecute: Function
 ) => {
   const tx = new Transaction();
 
   tx.moveCall({
     target: `${PACKAGE_ID}::matchmaker::propose_match`,
     arguments: [
+      tx.object(myTwinId),
       tx.pure.address(targetAddress),
-      tx.pure.string(blobId),
-      tx.pure.u8(score),
+      tx.pure.u8(clampProposalScore(score)),
       tx.pure.string(message),
     ],
   });
 
-  return await signAndExecute({ transaction: tx });
+  return tx;
+};
+
+export const buildAcceptProposalTx = (proposalId: string, myTwinId: string) => {
+  const tx = new Transaction();
+
+  tx.moveCall({
+    target: `${PACKAGE_ID}::matchmaker::accept_proposal`,
+    arguments: [tx.object(proposalId), tx.object(myTwinId)],
+  });
+
+  return tx;
+};
+
+export const buildRejectProposalTx = (proposalId: string) => {
+  const tx = new Transaction();
+
+  tx.moveCall({
+    target: `${PACKAGE_ID}::matchmaker::reject_proposal`,
+    arguments: [tx.object(proposalId)],
+  });
+
+  return tx;
+};
+
+export const buildWithdrawProposalTx = (proposalId: string) => {
+  const tx = new Transaction();
+
+  tx.moveCall({
+    target: `${PACKAGE_ID}::matchmaker::withdraw_proposal`,
+    arguments: [tx.object(proposalId)],
+  });
+
+  return tx;
+};
+
+export const proposeSuiMatch = async (
+  myTwinId: string,
+  targetAddress: string,
+  score: number,
+  message: string,
+  signAndExecute: SignAndExecute,
+) => {
+  return signAndExecute({
+    transaction: buildProposeMatchTx(myTwinId, targetAddress, score, message),
+  });
 };
