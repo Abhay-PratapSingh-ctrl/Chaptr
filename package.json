@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "@mysten/sui": "^0.0.0-experimental-20251202045132"
+  }
+}
