@@ -13,14 +13,34 @@ import { LinearGradient } from 'expo-linear-gradient';
 import { router, type Href } from 'expo-router';
 import * as WebBrowser from 'expo-web-browser';
 import * as AuthSession from 'expo-auth-session';
-import { setupZkLoginParams } from '@/utils/zkLoginService';
+import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
+import {
+  fetchZkProof,
+  loadZkLoginParams,
+  setupZkLoginParams,
+} from '@/utils/zkLoginService';
 
 WebBrowser.maybeCompleteAuthSession();
 
 const GOOGLE_CLIENT_ID = process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID || '';
+const TWIN_POOL_ID = process.env.EXPO_PUBLIC_TWIN_POOL_ID || '';
 
 const discovery = {
   authorizationEndpoint: 'https://accounts.google.com/o/oauth2/v2/auth',
+};
+
+const suiClient = new SuiJsonRpcClient({
+  url: getJsonRpcFullnodeUrl('testnet'),
+  network: 'testnet',
+});
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+const toPlainString = (value: any): string => {
+  if (typeof value === 'string') return value;
+  if (value?.id && typeof value.id === 'string') return value.id;
+  if (value === null || value === undefined) return '';
+  return String(value);
 };
 
 const hasLocalTwin = async () => {
@@ -33,9 +53,52 @@ const hasLocalTwin = async () => {
   return Boolean(myOwner && myTwinId && myScoutRef);
 };
 
+/**
+ * Queries the Twin Pool for an existing entry matching this Sui address.
+ * Returns { twinId, scoutRef } if found, null if not.
+ * Safe — never throws. Failure means "not found", falls through to onboarding.
+ */
+const lookupExistingTwin = async (
+  userAddress: string,
+): Promise<{ twinId: string; scoutRef: string } | null> => {
+  if (!TWIN_POOL_ID || !userAddress) return null;
+
+  try {
+    const obj = await suiClient.getObject({
+      id: TWIN_POOL_ID,
+      options: { showContent: true },
+    });
+
+    const fields = (obj.data?.content as any)?.fields;
+    const raw: any[] = fields?.entries ?? [];
+
+    const match = raw.find((entry) => {
+      const f = entry.fields ?? entry;
+      const owner = toPlainString(f.owner);
+      return owner.toLowerCase() === userAddress.toLowerCase();
+    });
+
+    if (!match) return null;
+
+    const f = match.fields ?? match;
+    const twinId = toPlainString(f.twin_id);
+    const scoutRef = toPlainString(f.scout_ref);
+
+    if (!twinId || !scoutRef) return null;
+
+    return { twinId, scoutRef };
+  } catch (err) {
+    console.warn('[ConnectScreen] Twin Pool lookup failed:', err);
+    return null;
+  }
+};
+
+// ─── Component ────────────────────────────────────────────────────────────────
+
 export default function ConnectScreen() {
   const [isChecking, setIsChecking] = useState(true);
   const [isConnecting, setIsConnecting] = useState(false);
+  const [isRestoring, setIsRestoring] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -71,6 +134,7 @@ export default function ConnectScreen() {
         throw new Error('Missing EXPO_PUBLIC_GOOGLE_CLIENT_ID');
       }
 
+      // Step 1: setup zkLogin params and run Google OAuth — identical to before
       const { nonce } = await setupZkLoginParams();
       const redirectUri = AuthSession.makeRedirectUri();
 
@@ -98,6 +162,34 @@ export default function ConnectScreen() {
         throw new Error('Google did not return an id_token');
       }
 
+      // Step 2: Derive Sui address from JWT.
+      // fetchZkProof is the same call used in every transaction flow.
+      // We need the userAddress to check the Twin Pool.
+      setIsConnecting(false);
+      setIsRestoring(true);
+
+      const { ephemeralKeyPair, maxEpoch, randomness } = await loadZkLoginParams();
+      const { userAddress } = await fetchZkProof(jwt, ephemeralKeyPair, maxEpoch, randomness);
+
+      // Step 3: Save owner address regardless — same as onboarding does
+      await AsyncStorage.setItem('chaptr:my-owner', userAddress);
+
+      // Step 4: Check if this address already has a Twin in the pool
+      const existing = await lookupExistingTwin(userAddress);
+
+      if (existing) {
+        // Returning user — restore their Twin from chain, skip onboarding
+        await Promise.all([
+          AsyncStorage.setItem('chaptr:my-twin-id', existing.twinId),
+          AsyncStorage.setItem('chaptr:my-scout-ref', existing.scoutRef),
+        ]);
+
+        router.replace('/(tabs)' as Href);
+        return;
+      }
+
+      // Step 5: Genuinely new user — go to onboarding exactly as before
+      // JWT is passed along so onboarding doesn't need another Google sign-in
       router.push({
         pathname: '/onboarding',
         params: { jwt },
@@ -106,9 +198,11 @@ export default function ConnectScreen() {
       setError(e?.message ?? 'Could not connect Google account.');
     } finally {
       setIsConnecting(false);
+      setIsRestoring(false);
     }
   };
 
+  // ─── Loading: initial storage check ────────────────────────────────────────
   if (isChecking) {
     return (
       <SafeAreaView style={styles.root}>
@@ -120,6 +214,19 @@ export default function ConnectScreen() {
     );
   }
 
+  // ─── Loading: restoring existing Twin from chain ────────────────────────────
+  if (isRestoring) {
+    return (
+      <SafeAreaView style={styles.root}>
+        <View style={styles.center}>
+          <ActivityIndicator color="#4ade80" />
+          <Text style={styles.muted}>Restoring your Twin...</Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  // ─── Main connect screen — visually identical to original ──────────────────
   return (
     <SafeAreaView style={styles.root}>
       <View style={styles.container}>
@@ -134,7 +241,7 @@ export default function ConnectScreen() {
         <TouchableOpacity
           style={styles.button}
           onPress={handleConnect}
-          disabled={isConnecting}
+          disabled={isConnecting || isRestoring}
           activeOpacity={0.9}
         >
           <LinearGradient colors={['#D94A8C', '#7A3EB8']} style={styles.buttonGradient}>
@@ -154,6 +261,7 @@ export default function ConnectScreen() {
   );
 }
 
+// ─── Styles — identical to original ──────────────────────────────────────────
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: '#0D0B10' },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 12 },
