@@ -19,7 +19,7 @@ import * as AuthSession from 'expo-auth-session';
 import { Transaction } from '@mysten/sui/transactions';
 import { getZkLoginSignature } from '@mysten/sui/zklogin';
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
-import { buildWithdrawProposalTx } from '@/utils/suiTransactions';
+import { buildEndMatchTx, buildWithdrawProposalTx } from '@/utils/suiTransactions';
 import {
   fetchZkProof,
   loadZkLoginParams,
@@ -30,6 +30,7 @@ import {
   loadLocalScoutCapsule,
   type ScoutCapsule,
 } from '@/utils/twinMemory';
+import { syncHumanMatchesFromSui } from '@/utils/matchSync';
 
 const AGGREGATOR = 'https://aggregator.walrus-testnet.walrus.space';
 const PUBLISHER = 'https://publisher.walrus-testnet.walrus.space';
@@ -143,6 +144,7 @@ interface ActiveProposal {
 }
 
 interface HumanMatch {
+  matchId?: string | null;
   proposalId: string;
   participantOwner: string;
   participantTwinId: string | null;
@@ -168,7 +170,6 @@ const showNotice = (title: string, message: string) => {
     window.alert(`${title}\n\n${message}`);
     return;
   }
-
   Alert.alert(title, message);
 };
 
@@ -178,7 +179,6 @@ const confirmAction = (title: string, message: string) =>
       resolve(window.confirm(`${title}\n\n${message}`));
       return;
     }
-
     Alert.alert(title, message, [
       { text: 'Cancel', style: 'cancel', onPress: () => resolve(false) },
       { text: 'Continue', style: 'destructive', onPress: () => resolve(true) },
@@ -230,6 +230,7 @@ const fetchProposalIdFromDigest = async (digest: string): Promise<string | null>
 
 interface AcceptedMatchEvent {
   proposalId: string | null;
+  matchId: string | null;
   from: string | null;
   to: string | null;
   score: number;
@@ -275,12 +276,12 @@ const parseAcceptedEvent = (event: any): AcceptedMatchEvent | null => {
 
   return {
     proposalId:
+      firstValue(parsed.proposal_id, parsed.proposalId, parsed.proposal?.id) || null,
+    matchId:
       firstValue(
-        parsed.proposal_id,
-        parsed.proposalId,
-        parsed.proposal?.id,
         parsed.match_id,
         parsed.matchId,
+        parsed.match?.id,
         parsed.id,
       ) || null,
     from:
@@ -314,6 +315,7 @@ const upsertHumanMatch = async (matches: HumanMatch[], record: HumanMatch) => {
     record,
     ...matches.filter(
       (match) =>
+        (match.matchId ?? match.proposalId) !== (record.matchId ?? record.proposalId) &&
         match.proposalId !== record.proposalId &&
         !sameAddress(match.participantOwner, record.participantOwner),
     ),
@@ -358,6 +360,7 @@ const syncActiveProposalAcceptance = async (
   if (!accepted) return { proposal: syncedProposal, matches };
 
   const nextMatches = await upsertHumanMatch(matches, {
+    matchId: accepted.matchId ?? accepted.proposalId ?? proposalId ?? syncedProposal.digest,
     proposalId: proposalId ?? accepted.proposalId ?? syncedProposal.digest,
     participantOwner: syncedProposal.candidateOwner,
     participantTwinId: syncedProposal.candidateTwinId,
@@ -411,10 +414,10 @@ const executeZkLoginTransaction = async (
   );
 
   if (userAddress.toLowerCase() !== expectedOwner.toLowerCase()) {
-    throw new Error('Selected Google account does not match this local Chaptr identity.');
+    throw new Error('Selected Google account does not match this browser identity.');
   }
 
-  tx.setSender(expectedOwner);
+  tx.setSender(userAddress);
 
   const { bytes, signature: userSignature } = await tx.sign({
     client: suiClient,
@@ -841,6 +844,9 @@ const entryToProfile = (entry: PoolEntry, scout: ScoutProfile): Profile => {
   };
 };
 
+// ─── Avatar initial helper ────────────────────────────────────────────────────
+const getInitial = (name: string) => (name ?? '?').charAt(0).toUpperCase();
+
 export default function MorningBriefingScreen() {
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [passedProfileIds, setPassedProfileIds] = useState<string[]>([]);
@@ -852,6 +858,7 @@ export default function MorningBriefingScreen() {
   const [error, setError] = useState<string | null>(null);
   const [isWithdrawing, setIsWithdrawing] = useState(false);
   const [isLoggingOut, setIsLoggingOut] = useState(false);
+  const [isEndingMatch, setIsEndingMatch] = useState(false);
 
   const loadPoolProfiles = useCallback(async () => {
     setIsLoading(true);
@@ -940,18 +947,27 @@ export default function MorningBriefingScreen() {
   }, []);
 
   const loadSavedState = useCallback(async () => {
-    const [passed, unlocked, proposal, matches, myOwner] = await Promise.all([
+    const [passed, unlocked, proposal, myOwner] = await Promise.all([
       readStringArray(PASSED_PROFILES_KEY),
       readStringArray(UNLOCKED_PROFILES_KEY),
       readActiveProposal(),
-      readHumanMatches(),
       AsyncStorage.getItem('chaptr:my-owner'),
     ]);
 
-    const synced = await syncActiveProposalAcceptance(proposal, matches, myOwner).catch(
+    // Chain-first match discovery: works for both proposer and receiver in any browser.
+    // Falls back to local storage if chain is unreachable.
+    const chainMatches = myOwner
+      ? await syncHumanMatchesFromSui(myOwner).catch((err) => {
+          console.warn('[loadSavedState] chain sync failed, reading local:', err);
+          return readHumanMatches();
+        })
+      : await readHumanMatches();
+
+    // Still run the existing proposal-acceptance sync on top, passing chain matches in.
+    const synced = await syncActiveProposalAcceptance(proposal, chainMatches, myOwner).catch(
       (error) => {
         console.warn('Accepted match sync failed:', error);
-        return { proposal, matches };
+        return { proposal, matches: chainMatches };
       },
     );
 
@@ -999,6 +1015,8 @@ export default function MorningBriefingScreen() {
     [profiles, passedProfileIds],
   );
 
+  const activeHumanMatch = useMemo(() => humanMatches[0] ?? null, [humanMatches]);
+
   const handlePass = (profileId: string) => {
     setPassedProfileIds((prev) => {
       const next = Array.from(new Set([...prev, profileId]));
@@ -1014,7 +1032,7 @@ export default function MorningBriefingScreen() {
       router.push({
         pathname: '/human-chat/[id]',
         params: {
-          id: humanMatch.proposalId,
+          id: humanMatch.matchId ?? humanMatch.proposalId,
           name: humanMatch.participantName,
         },
       } as Href);
@@ -1048,7 +1066,10 @@ export default function MorningBriefingScreen() {
     if (humanMatch) {
       router.push({
         pathname: '/human-chat/[id]',
-        params: { id: humanMatch.proposalId, name: humanMatch.participantName },
+        params: {
+          id: humanMatch.matchId ?? humanMatch.proposalId,
+          name: humanMatch.participantName,
+        },
       } as Href);
       return;
     }
@@ -1145,151 +1166,240 @@ export default function MorningBriefingScreen() {
     }
   }, [activeProposal]);
 
+  const openCurrentHumanMatch = useCallback(() => {
+    if (!activeHumanMatch) return;
+
+    router.push({
+      pathname: '/human-chat/[id]',
+      params: {
+        id: activeHumanMatch.matchId ?? activeHumanMatch.proposalId,
+        name: activeHumanMatch.participantName,
+      },
+    } as Href);
+  }, [activeHumanMatch]);
+
+  const handleEndActiveMatch = useCallback(async () => {
+    if (!activeHumanMatch) return;
+
+    const matchId = activeHumanMatch.matchId;
+
+    if (!matchId) {
+      showNotice(
+        'Cannot end match yet',
+        'This local match record is missing the on-chain Match ID. Accept a fresh proposal or resync this match first.',
+      );
+      return;
+    }
+
+    const confirmed = await confirmAction(
+      'End current match?',
+      `This ends your match with ${activeHumanMatch.participantName} and releases both Twins.`,
+    );
+
+    if (!confirmed) return;
+
+    setIsEndingMatch(true);
+
+    try {
+      const myOwner = await AsyncStorage.getItem('chaptr:my-owner');
+      if (!myOwner) throw new Error('Missing local owner address.');
+
+      const jwt = await getJwtForTransaction();
+      const tx = buildEndMatchTx(matchId);
+
+      await executeZkLoginTransaction(tx, myOwner, jwt);
+
+      const nextMatches = humanMatches.filter(
+        (match) =>
+          (match.matchId ?? match.proposalId) !==
+          (activeHumanMatch.matchId ?? activeHumanMatch.proposalId),
+      );
+
+      await AsyncStorage.setItem(HUMAN_MATCHES_KEY, JSON.stringify(nextMatches));
+      setHumanMatches(nextMatches);
+
+      showNotice('Match ended', 'Both Twins are free again.');
+    } catch (error: any) {
+      showNotice('End match failed', error?.message ?? 'Could not end this match.');
+    } finally {
+      setIsEndingMatch(false);
+    }
+  }, [activeHumanMatch, humanMatches]);
+
+  // ─── Profile card renderer ──────────────────────────────────────────────────
   const renderProfileCard = ({ item, index }: { item: Profile; index: number }) => {
     const isTopCard = index === 0;
     const isUnlocked = unlockedProfileIds.includes(item.id);
     const isFocusedProfile = activeProposal?.candidateTwinId === item.id;
     const humanMatch = findHumanMatchForProfile(humanMatches, item);
 
+    const scoreColor =
+      item.compatibility >= 85 ? '#4ade80' : item.compatibility >= 70 ? '#D94A8C' : '#A299A8';
+
     return (
       <View style={[styles.card, isTopCard && styles.focusCard]}>
         <LinearGradient
           colors={
             isTopCard
-              ? ['rgba(217, 74, 140, 0.22)', 'rgba(18, 15, 24, 0.96)']
-              : ['rgba(42, 36, 50, 0.9)', 'rgba(18, 15, 24, 0.96)']
+              ? ['rgba(217,74,140,0.18)', 'rgba(122,62,184,0.10)', 'rgba(13,11,16,0.98)']
+              : ['rgba(30,24,38,0.95)', 'rgba(13,11,16,0.98)']
           }
+          start={{ x: 0, y: 0 }}
+          end={{ x: 1, y: 1 }}
           style={styles.cardGradient}
         >
+          {/* Top section */}
           <View style={styles.cardHeader}>
+            {/* Avatar */}
             <View style={styles.avatar}>
               <Image
                 source={{ uri: item.photoUrl }}
                 style={styles.avatarImage}
                 blurRadius={isUnlocked ? 0 : 18}
               />
-
               {!isUnlocked && (
                 <View style={styles.lockOverlay}>
-                  <Text style={styles.lockText}>LOCKED</Text>
+                  <Text style={styles.lockIcon}>🔒</Text>
                 </View>
               )}
             </View>
 
+            {/* Info */}
             <View style={styles.profileInfo}>
               <View style={styles.nameRow}>
                 <Text style={styles.profileName}>
-                  {item.name}
-                  {item.age > 0 ? `, ${item.age}` : ''}
+                  {item.name}{item.age > 0 ? `, ${item.age}` : ''}
                 </Text>
-
                 <View style={styles.zkBadge}>
                   <Text style={styles.zkBadgeText}>ZK</Text>
                 </View>
               </View>
 
-              {item.location ? <Text style={styles.location}>{item.location}</Text> : null}
+              {item.location ? (
+                <Text style={styles.location}>📍 {item.location}</Text>
+              ) : null}
 
-              <Text style={styles.bio} numberOfLines={3}>
-                {item.bio}
-              </Text>
+              <Text style={styles.bio} numberOfLines={2}>{item.bio}</Text>
 
-              <Text style={humanMatch ? styles.unlockedHint : isFocusedProfile ? styles.focusHint : isUnlocked ? styles.unlockedHint : styles.lockedHint}>
-                {humanMatch
-                  ? 'Human match accepted — open human chat'
-                  : isFocusedProfile
-                    ? 'Your Twin is focused here'
+              <Text
+                style={[
+                  styles.statusHint,
+                  humanMatch
+                    ? styles.hintGreen
+                    : isFocusedProfile
+                    ? styles.hintGreen
                     : isUnlocked
-                      ? 'Human profile unlocked'
-                      : 'Chat to unlock human profile'}
+                    ? styles.hintGreen
+                    : styles.hintMuted,
+                ]}
+              >
+                {humanMatch
+                  ? '✦ Human match — open chat'
+                  : isFocusedProfile
+                  ? '✦ Your Twin is focused here'
+                  : isUnlocked
+                  ? '✦ Human profile unlocked'
+                  : '· Chat to unlock profile'}
               </Text>
             </View>
 
-            <View style={styles.compatibilityPill}>
-              <Text style={styles.compatibilityValue}>{item.compatibility}%</Text>
-              <Text style={styles.compatibilityLabel}>match</Text>
+            {/* Score pill */}
+            <View style={[styles.scorePill, { borderColor: scoreColor + '55' }]}>
+              <Text style={[styles.scoreValue, { color: scoreColor }]}>
+                {item.compatibility}%
+              </Text>
+              <Text style={styles.scoreLabel}>match</Text>
             </View>
           </View>
 
+          {/* Expanded content for top card */}
           {isTopCard && (
             <>
-              <View style={styles.overheardBox}>
+              <View style={styles.divider} />
+
+              {/* Scout report / Overheard */}
+              <View style={styles.reportBox}>
                 {item.report ? (
                   <>
-                    <Text style={styles.overheardTitle}>
+                    <Text style={styles.reportTitle}>
                       Your Twin's Scout Report · {item.report.score}% match
                     </Text>
 
-                    <View style={styles.chatLine}>
-                      <Text style={styles.chatLineText}>{item.report.summary}</Text>
+                    <View style={styles.reportLine}>
+                      <Text style={styles.reportLineText}>{item.report.summary}</Text>
                     </View>
 
                     {item.report.reasons.map((reason, i) => (
-                      <View key={`reason-${i}`} style={styles.chatLine}>
-                        <Text style={styles.chatLineText}>Why: {reason}</Text>
+                      <View key={`r-${i}`} style={styles.reportLine}>
+                        <Text style={styles.reportLineMuted}>Why: </Text>
+                        <Text style={styles.reportLineText}>{reason}</Text>
                       </View>
                     ))}
 
                     {item.report.risks.slice(0, 1).map((risk, i) => (
-                      <View key={`risk-${i}`} style={styles.chatLine}>
-                        <Text style={styles.chatLineText}>Watch-out: {risk}</Text>
+                      <View key={`risk-${i}`} style={[styles.reportLine, styles.reportLineRisk]}>
+                        <Text style={styles.reportLineMuted}>Watch-out: </Text>
+                        <Text style={styles.reportLineText}>{risk}</Text>
                       </View>
                     ))}
 
-                    <View style={styles.chatLine}>
-                      <Text style={styles.chatLineText}>
-                        Opener: {item.report.suggestedOpener}
-                      </Text>
+                    <View style={[styles.reportLine, styles.reportLineOpener]}>
+                      <Text style={styles.reportLineMuted}>Opener: </Text>
+                      <Text style={styles.reportLineText}>{item.report.suggestedOpener}</Text>
                     </View>
                   </>
                 ) : (
                   <>
-                    <Text style={styles.overheardTitle}>
-                      Overheard: Your Agent and {item.name}'s Agent
+                    <Text style={styles.reportTitle}>
+                      Overheard: Your Agent &amp; {item.name}'s Agent
                     </Text>
-
                     {item.overheard.map((line, i) => (
-                      <View key={i} style={styles.chatLine}>
-                        <Text style={styles.chatLineText}>{line}</Text>
+                      <View key={i} style={styles.reportLine}>
+                        <Text style={styles.reportLineText}>{line}</Text>
                       </View>
                     ))}
                   </>
                 )}
               </View>
 
-              <Text style={styles.blobId}>
-                Scout ref: {item.scoutRef.slice(0, 14)}...
-                {item.reportRef ? ` · Report ref: ${item.reportRef.slice(0, 14)}...` : ''}
+              <Text style={styles.refText}>
+                Scout ref: {item.scoutRef.slice(0, 14)}…
+                {item.reportRef ? ` · Report: ${item.reportRef.slice(0, 14)}…` : ''}
               </Text>
 
+              {/* Action buttons */}
               <View style={styles.actionRow}>
                 <TouchableOpacity
                   style={styles.passButton}
                   onPress={() => handlePass(item.id)}
-                  activeOpacity={0.85}
+                  activeOpacity={0.8}
                 >
                   <Text style={styles.passButtonText}>Pass</Text>
                 </TouchableOpacity>
 
                 <TouchableOpacity
-                  style={styles.chatButton}
+                  style={styles.chatButtonWrap}
                   onPress={() => handleChatWithAgent(item)}
-                  activeOpacity={0.9}
+                  activeOpacity={0.88}
                 >
                   <LinearGradient
-                    colors={isFocusedProfile ? ['#4ade80', '#1f8f54'] : ['#D94A8C', '#7A3EB8']}
+                    colors={
+                      isFocusedProfile || humanMatch
+                        ? ['#2ecc71', '#1a9950']
+                        : ['#D94A8C', '#7A3EB8']
+                    }
                     start={{ x: 0, y: 0 }}
-                    end={{ x: 1, y: 1 }}
+                    end={{ x: 1, y: 0 }}
                     style={styles.chatButtonGradient}
                   >
                     <Text style={styles.chatButtonText}>
                       {humanMatch
                         ? 'Open Human Chat'
                         : isFocusedProfile
-                          ? 'Open Focus Chat'
-                          : isUnlocked
-                            ? 'Continue Chat'
-                            : 'Chat with Agent'}
+                        ? 'Open Focus Chat'
+                        : isUnlocked
+                        ? 'Continue Chat'
+                        : 'Chat with Agent'}
                     </Text>
                   </LinearGradient>
                 </TouchableOpacity>
@@ -1301,37 +1411,41 @@ export default function MorningBriefingScreen() {
     );
   };
 
+  // ─── Loading state ──────────────────────────────────────────────────────────
   if (isLoading) {
     return (
       <SafeAreaView style={styles.root}>
         <View style={styles.loadingContainer}>
           <ActivityIndicator color="#D94A8C" size="large" />
-          <Text style={styles.loadingText}>Scouting the Twin Pool...</Text>
+          <Text style={styles.loadingText}>Scouting the Twin Pool…</Text>
         </View>
       </SafeAreaView>
     );
   }
 
+  // ─── No twin ────────────────────────────────────────────────────────────────
   if (hasLocalTwin === false) {
     return (
       <SafeAreaView style={styles.root}>
         <View style={styles.noSessionContainer}>
-          <Text style={styles.logo}>Chaptr.</Text>
+          <Text style={styles.logoText}>Chaptr.</Text>
           <Text style={styles.noSessionTitle}>Create your Twin first</Text>
-          <Text style={styles.noSessionText}>
-            This browser does not have a local Chaptr identity yet. Create your Twin to scout, chat, and receive proposals.
+          <Text style={styles.noSessionBody}>
+            This browser doesn't have a local Chaptr identity yet. Create your Twin to scout, chat, and receive proposals.
           </Text>
 
           <TouchableOpacity
-            style={styles.chatButton}
+            style={styles.primaryButtonWrap}
             onPress={() => router.replace('/' as Href)}
             activeOpacity={0.9}
           >
             <LinearGradient
               colors={['#D94A8C', '#7A3EB8']}
-              style={styles.chatButtonGradient}
+              start={{ x: 0, y: 0 }}
+              end={{ x: 1, y: 0 }}
+              style={styles.primaryButtonGradient}
             >
-              <Text style={styles.chatButtonText}>Connect with Google</Text>
+              <Text style={styles.primaryButtonText}>Connect with Google</Text>
             </LinearGradient>
           </TouchableOpacity>
         </View>
@@ -1339,83 +1453,181 @@ export default function MorningBriefingScreen() {
     );
   }
 
+  // ─── Main screen ────────────────────────────────────────────────────────────
   return (
     <SafeAreaView style={styles.root}>
       <View style={styles.container}>
-        <Text style={styles.logo}>Chaptr.</Text>
 
-        <View style={styles.topActions}>
-          <TouchableOpacity style={styles.utilityButton} onPress={openProposals} activeOpacity={0.85}>
-            <Text style={styles.utilityButtonText}>View Proposals</Text>
-          </TouchableOpacity>
+        {/* Header */}
+        <View style={styles.headerRow}>
+          <Text style={styles.logoText}>Chaptr.</Text>
+          <View style={styles.headerActions}>
+            <TouchableOpacity
+              style={styles.pillButton}
+              onPress={openProposals}
+              activeOpacity={0.85}
+            >
+              <Text style={styles.pillButtonText}>Proposals</Text>
+            </TouchableOpacity>
 
-          <TouchableOpacity
-            style={[styles.utilityButton, styles.logoutButton]}
-            onPress={handleLogout}
-            disabled={isLoggingOut}
-            activeOpacity={0.85}
-          >
-            <Text style={[styles.utilityButtonText, styles.logoutButtonText]}>
-              {isLoggingOut ? 'Logging Out...' : 'Log Out'}
-            </Text>
-          </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.pillButton, styles.pillButtonDanger]}
+              onPress={handleLogout}
+              disabled={isLoggingOut}
+              activeOpacity={0.85}
+            >
+              <Text style={[styles.pillButtonText, styles.pillButtonDangerText]}>
+                {isLoggingOut ? 'Leaving…' : 'Log Out'}
+              </Text>
+            </TouchableOpacity>
+          </View>
         </View>
 
-        {activeProposal ? (
-          <View style={styles.focusBanner}>
-            <Text style={styles.focusBannerKicker}>Focus Mode</Text>
-            <Text style={styles.focusBannerTitle}>
-              Your Twin is focused on {activeProposal.candidateName}.
-            </Text>
-            <Text style={styles.focusBannerText}>
-              You can still browse and chat, but you cannot propose again until this proposal is resolved.
-            </Text>
+        {/* ── Current Match Banner ── */}
+        {activeHumanMatch ? (
+          <View style={styles.matchBannerOuter}>
+            <LinearGradient
+              colors={['rgba(74,222,128,0.14)', 'rgba(217,74,140,0.10)', 'rgba(18,15,24,0.97)']}
+              start={{ x: 0, y: 0 }}
+              end={{ x: 1, y: 1 }}
+              style={styles.matchBannerGradient}
+            >
+              {/* Top row: label + LIVE pill */}
+              <View style={styles.matchBannerTopRow}>
+                <Text style={styles.matchBannerKicker}>CURRENT MATCH</Text>
+                <View style={styles.livePill}>
+                  <View style={styles.liveDot} />
+                  <Text style={styles.livePillText}>LIVE</Text>
+                </View>
+              </View>
 
-            <View style={styles.focusActions}>
-              <TouchableOpacity style={styles.focusActionButton} onPress={openActiveProposal}>
-                <Text style={styles.focusActionText}>Open Focus Chat</Text>
-              </TouchableOpacity>
+              {/* Avatar + name row */}
+              <View style={styles.matchIdentityRow}>
+                <View style={styles.matchAvatar}>
+                  <Text style={styles.matchAvatarInitial}>
+                    {getInitial(activeHumanMatch.participantName)}
+                  </Text>
+                </View>
+                <View style={styles.matchIdentityText}>
+                  <Text style={styles.matchBannerName}>
+                    {activeHumanMatch.participantName} is your current chapter.
+                  </Text>
+                  <View style={styles.matchMetaRow}>
+                    <View style={styles.metaPill}>
+                      <Text style={styles.metaPillText}>1 active match</Text>
+                    </View>
+                    <View style={styles.metaPill}>
+                      <Text style={styles.metaPillText}>Sui locked</Text>
+                    </View>
+                  </View>
+                </View>
+              </View>
 
-              <TouchableOpacity
-                style={[styles.focusActionButton, styles.withdrawButton]}
-                onPress={handleWithdrawActiveProposal}
-                disabled={isWithdrawing}
-              >
-                <Text style={[styles.focusActionText, styles.withdrawButtonText]}>
-                  {isWithdrawing ? 'Withdrawing...' : 'Withdraw'}
-                </Text>
-              </TouchableOpacity>
-            </View>
+              {/* Actions */}
+              <View style={styles.matchBannerActions}>
+                <TouchableOpacity
+                  style={styles.matchChatButtonWrap}
+                  onPress={openCurrentHumanMatch}
+                  activeOpacity={0.88}
+                >
+                  <LinearGradient
+                    colors={['#D94A8C', '#7A3EB8']}
+                    start={{ x: 0, y: 0 }}
+                    end={{ x: 1, y: 0 }}
+                    style={styles.matchChatGradient}
+                  >
+                    <Text style={styles.matchChatText}>Open Human Chat</Text>
+                  </LinearGradient>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={styles.endMatchButton}
+                  onPress={handleEndActiveMatch}
+                  disabled={isEndingMatch}
+                  activeOpacity={0.8}
+                >
+                  <Text style={styles.endMatchText}>
+                    {isEndingMatch ? 'Ending…' : 'End Match'}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            </LinearGradient>
+          </View>
+        ) : activeProposal ? (
+          /* ── Focus Mode Banner ── */
+          <View style={styles.focusBannerOuter}>
+            <LinearGradient
+              colors={['rgba(74,222,128,0.10)', 'rgba(13,11,16,0.97)']}
+              style={styles.focusBannerGradient}
+            >
+              <View style={styles.focusTopRow}>
+                <Text style={styles.focusKicker}>FOCUS MODE</Text>
+                <View style={styles.focusBadge}>
+                  <Text style={styles.focusBadgeText}>Pending</Text>
+                </View>
+              </View>
+
+              <Text style={styles.focusTitle}>
+                Your Twin is focused on {activeProposal.candidateName}.
+              </Text>
+              <Text style={styles.focusBody}>
+                You can browse and chat, but cannot propose again until this resolves.
+              </Text>
+
+              <View style={styles.focusActions}>
+                <TouchableOpacity
+                  style={styles.focusActionPrimary}
+                  onPress={openActiveProposal}
+                  activeOpacity={0.85}
+                >
+                  <Text style={styles.focusActionPrimaryText}>Open Focus Chat</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={styles.focusActionSecondary}
+                  onPress={handleWithdrawActiveProposal}
+                  disabled={isWithdrawing}
+                  activeOpacity={0.8}
+                >
+                  <Text style={styles.focusActionSecondaryText}>
+                    {isWithdrawing ? 'Withdrawing…' : 'Withdraw'}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            </LinearGradient>
           </View>
         ) : null}
 
-        <View style={styles.titleRow}>
-          <Text style={styles.title}>Your Morning Briefing</Text>
-          <Text style={styles.clock}>
+        {/* ── Morning Briefing header ── */}
+        <View style={styles.briefingHeaderRow}>
+          <View>
+            <Text style={styles.briefingTitle}>Your Morning Briefing</Text>
+            <Text style={styles.briefingSubtitle}>
+              {topConnections.length > 0
+                ? `Your Twin scouted ${topConnections.length} compatible profile${topConnections.length === 1 ? '' : 's'} from the pool.`
+                : 'Your Agent is waiting for compatible Twins to join the pool.'}
+            </Text>
+          </View>
+          <Text style={styles.briefingClock}>
             {new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
           </Text>
         </View>
 
-        <Text style={styles.subtitle}>
-          {topConnections.length > 0
-            ? `Your Twin scouted ${topConnections.length} compatible profile${topConnections.length === 1 ? '' : 's'} from the pool.`
-            : 'Your Agent is waiting for compatible Twins to join the pool.'}
-        </Text>
-
         {error ? <Text style={styles.errorText}>{error}</Text> : null}
 
+        {/* ── Profile list ── */}
         <FlatList
           data={topConnections}
           keyExtractor={(item) => item.id}
           renderItem={renderProfileCard}
           contentContainerStyle={styles.listContent}
           showsVerticalScrollIndicator={false}
-          extraData={`${passedProfileIds.join(',')}-${unlockedProfileIds.join(',')}-${humanMatches.map((m) => m.proposalId).join(',')}-${activeProposal?.candidateTwinId ?? ''}`}
+          extraData={`${passedProfileIds.join(',')}-${unlockedProfileIds.join(',')}-${humanMatches.map((m) => m.matchId ?? m.proposalId).join(',')}-${activeProposal?.candidateTwinId ?? ''}`}
           ListEmptyComponent={
             !error ? (
               <View style={styles.emptyState}>
                 <Text style={styles.emptyTitle}>No compatible Twins yet</Text>
-                <Text style={styles.emptyText}>
+                <Text style={styles.emptyBody}>
                   The pool may be empty, filtered by preferences, or only contain your own Twin.
                 </Text>
               </View>
@@ -1427,17 +1639,21 @@ export default function MorningBriefingScreen() {
   );
 }
 
+// ─── Styles ───────────────────────────────────────────────────────────────────
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: '#0D0B10' },
+
+  // Loading
   loadingContainer: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 14 },
-  loadingText: { color: '#A299A8', fontSize: 14 },
+  loadingText: { color: '#A299A8', fontSize: 14, letterSpacing: 0.3 },
+
+  // No session
   noSessionContainer: {
     flex: 1,
-    width: '100%',
     maxWidth: 520,
     alignSelf: 'center',
     justifyContent: 'center',
-    padding: 24,
+    paddingHorizontal: 28,
   },
   noSessionTitle: {
     color: '#FDFBF7',
@@ -1446,228 +1662,408 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     marginBottom: 10,
   },
-  noSessionText: {
+  noSessionBody: {
     color: '#A299A8',
     fontSize: 15,
     lineHeight: 22,
     textAlign: 'center',
-    marginBottom: 24,
+    marginBottom: 28,
   },
+  primaryButtonWrap: { height: 52, borderRadius: 18, overflow: 'hidden' },
+  primaryButtonGradient: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  primaryButtonText: { color: '#FFF', fontSize: 16, fontWeight: '800' },
+
+  // Main layout
   container: {
     flex: 1,
-    width: '100%',
-    maxWidth: 600,
+    maxWidth: 620,
     alignSelf: 'center',
-    paddingHorizontal: 18,
-    paddingTop: 14,
+    width: '100%',
+    paddingHorizontal: 16,
+    paddingTop: 12,
   },
-  logo: {
-    color: '#FDFBF7',
-    fontSize: 24,
-    fontWeight: '800',
-    textAlign: 'center',
-    marginBottom: 18,
-    fontFamily: Platform.OS === 'ios' ? 'Georgia' : 'serif',
-  },
-  topActions: {
+
+  // Header row
+  headerRow: {
     flexDirection: 'row',
-    justifyContent: 'center',
-    gap: 10,
-    marginBottom: 14,
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 16,
   },
-  utilityButton: {
+  logoText: {
+    color: '#FDFBF7',
+    fontSize: 22,
+    fontWeight: '800',
+    fontFamily: Platform.OS === 'ios' ? 'Georgia' : 'serif',
+    letterSpacing: 0.4,
+  },
+  headerActions: { flexDirection: 'row', gap: 8 },
+  pillButton: {
     borderWidth: 1,
     borderColor: '#2A2432',
     backgroundColor: '#16131A',
     borderRadius: 999,
-    paddingHorizontal: 14,
-    paddingVertical: 8,
+    paddingHorizontal: 13,
+    paddingVertical: 7,
   },
-  utilityButtonText: {
-    color: '#A299A8',
-    fontSize: 12,
-    fontWeight: '800',
-  },
-  logoutButton: {
-    borderColor: 'rgba(248, 113, 113, 0.38)',
-  },
-  logoutButtonText: {
-    color: '#f87171',
-  },
-  focusBanner: {
+  pillButtonText: { color: '#A299A8', fontSize: 12, fontWeight: '700' },
+  pillButtonDanger: { borderColor: 'rgba(248,113,113,0.35)' },
+  pillButtonDangerText: { color: '#f87171' },
+
+  // ── Current Match Banner ──────────────────────────────────────────────────
+  matchBannerOuter: {
+    borderRadius: 22,
+    overflow: 'hidden',
     borderWidth: 1,
-    borderColor: 'rgba(74, 222, 128, 0.46)',
-    backgroundColor: 'rgba(74, 222, 128, 0.1)',
-    borderRadius: 16,
-    padding: 14,
-    marginBottom: 16,
+    borderColor: 'rgba(74,222,128,0.38)',
+    marginBottom: 18,
+    // shadow
+    shadowColor: '#4ade80',
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.18,
+    shadowRadius: 16,
+    elevation: 8,
   },
-  focusBannerKicker: {
+  matchBannerGradient: {
+    padding: 18,
+  },
+  matchBannerTopRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 14,
+  },
+  matchBannerKicker: {
     color: '#4ade80',
     fontSize: 11,
     fontWeight: '900',
-    letterSpacing: 1.2,
-    textTransform: 'uppercase',
-    marginBottom: 6,
+    letterSpacing: 2,
   },
-  focusBannerTitle: {
-    color: '#FDFBF7',
-    fontSize: 16,
-    fontWeight: '800',
-    marginBottom: 4,
-  },
-  focusBannerText: {
-    color: '#A7B8AB',
-    fontSize: 12,
-    lineHeight: 17,
-  },
-  focusActions: {
+  livePill: {
     flexDirection: 'row',
-    gap: 10,
-    marginTop: 12,
-  },
-  focusActionButton: {
-    flex: 1,
-    minHeight: 40,
-    borderRadius: 12,
+    alignItems: 'center',
+    gap: 5,
     borderWidth: 1,
-    borderColor: 'rgba(74, 222, 128, 0.36)',
+    borderColor: 'rgba(74,222,128,0.5)',
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    backgroundColor: 'rgba(74,222,128,0.10)',
+  },
+  liveDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: '#4ade80',
+  },
+  livePillText: {
+    color: '#4ade80',
+    fontSize: 10,
+    fontWeight: '900',
+    letterSpacing: 1.5,
+  },
+  matchIdentityRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 14,
+    marginBottom: 16,
+  },
+  matchAvatar: {
+    width: 52,
+    height: 52,
+    borderRadius: 26,
+    backgroundColor: 'rgba(217,74,140,0.22)',
+    borderWidth: 2,
+    borderColor: 'rgba(217,74,140,0.55)',
     alignItems: 'center',
     justifyContent: 'center',
-    paddingHorizontal: 10,
   },
-  focusActionText: {
-    color: '#DDFBE7',
-    fontSize: 12,
+  matchAvatarInitial: {
+    color: '#FDFBF7',
+    fontSize: 22,
     fontWeight: '900',
   },
-  withdrawButton: {
-    borderColor: 'rgba(248, 113, 113, 0.5)',
-    backgroundColor: 'rgba(248, 113, 113, 0.1)',
+  matchIdentityText: { flex: 1 },
+  matchBannerName: {
+    color: '#FDFBF7',
+    fontSize: 17,
+    fontWeight: '800',
+    lineHeight: 22,
+    marginBottom: 8,
   },
-  withdrawButtonText: {
-    color: '#fecaca',
-  },
-  titleRow: {
+  matchMetaRow: {
     flexDirection: 'row',
-    alignItems: 'baseline',
-    justifyContent: 'space-between',
-    gap: 12,
+    gap: 8,
   },
-  title: { color: '#FDFBF7', fontSize: 25, fontWeight: '800', flex: 1 },
-  clock: { color: '#D94A8C', fontSize: 13, fontWeight: '700', letterSpacing: 1 },
-  subtitle: {
-    color: '#A299A8',
+  metaPill: {
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: 'rgba(74,222,128,0.28)',
+    backgroundColor: 'rgba(74,222,128,0.07)',
+    paddingHorizontal: 9,
+    paddingVertical: 3,
+  },
+  metaPillText: {
+    color: '#a7f3d0',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  matchBannerActions: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  matchChatButtonWrap: {
+    flex: 2,
+    height: 48,
+    borderRadius: 16,
+    overflow: 'hidden',
+    shadowColor: '#D94A8C',
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.45,
+    shadowRadius: 12,
+    elevation: 6,
+  },
+  matchChatGradient: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  matchChatText: {
+    color: '#FFF',
     fontSize: 14,
-    lineHeight: 20,
-    marginTop: 8,
-    marginBottom: 18,
+    fontWeight: '900',
+    letterSpacing: 0.3,
   },
-  errorText: {
-    color: '#D94A8C',
+  endMatchButton: {
+    flex: 1,
+    height: 48,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: 'rgba(248,113,113,0.55)',
+    backgroundColor: 'rgba(248,113,113,0.08)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  endMatchText: {
+    color: '#fca5a5',
     fontSize: 13,
-    textAlign: 'center',
-    marginBottom: 12,
+    fontWeight: '900',
   },
-  listContent: { paddingBottom: 28, gap: 14 },
-  card: {
-    borderRadius: 18,
+
+  // ── Focus Banner ──────────────────────────────────────────────────────────
+  focusBannerOuter: {
+    borderRadius: 20,
     overflow: 'hidden',
     borderWidth: 1,
-    borderColor: '#2A2432',
+    borderColor: 'rgba(74,222,128,0.32)',
+    marginBottom: 18,
+  },
+  focusBannerGradient: { padding: 16 },
+  focusTopRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
+  focusKicker: {
+    color: '#4ade80',
+    fontSize: 11,
+    fontWeight: '900',
+    letterSpacing: 2,
+  },
+  focusBadge: {
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: 'rgba(74,222,128,0.35)',
+    paddingHorizontal: 9,
+    paddingVertical: 3,
+    backgroundColor: 'rgba(74,222,128,0.08)',
+  },
+  focusBadgeText: { color: '#a7f3d0', fontSize: 11, fontWeight: '700' },
+  focusTitle: { color: '#FDFBF7', fontSize: 16, fontWeight: '800', marginBottom: 4 },
+  focusBody: { color: '#8DA89A', fontSize: 12, lineHeight: 17, marginBottom: 12 },
+  focusActions: { flexDirection: 'row', gap: 10 },
+  focusActionPrimary: {
+    flex: 1,
+    height: 42,
+    borderRadius: 13,
+    borderWidth: 1,
+    borderColor: 'rgba(74,222,128,0.42)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(74,222,128,0.08)',
+  },
+  focusActionPrimaryText: { color: '#d1fae5', fontSize: 13, fontWeight: '800' },
+  focusActionSecondary: {
+    flex: 1,
+    height: 42,
+    borderRadius: 13,
+    borderWidth: 1,
+    borderColor: 'rgba(248,113,113,0.45)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(248,113,113,0.08)',
+  },
+  focusActionSecondaryText: { color: '#fecaca', fontSize: 13, fontWeight: '800' },
+
+  // ── Briefing header ────────────────────────────────────────────────────────
+  briefingHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    justifyContent: 'space-between',
+    marginBottom: 14,
+    gap: 10,
+  },
+  briefingTitle: {
+    color: '#FDFBF7',
+    fontSize: 24,
+    fontWeight: '800',
+  },
+  briefingSubtitle: {
+    color: '#A299A8',
+    fontSize: 13,
+    lineHeight: 19,
+    marginTop: 4,
+    maxWidth: 300,
+  },
+  briefingClock: {
+    color: '#D94A8C',
+    fontSize: 13,
+    fontWeight: '700',
+    letterSpacing: 0.8,
+    marginTop: 4,
+  },
+
+  errorText: { color: '#D94A8C', fontSize: 13, textAlign: 'center', marginBottom: 10 },
+
+  // ── Profile list ───────────────────────────────────────────────────────────
+  listContent: { paddingBottom: 32, gap: 14 },
+
+  card: {
+    borderRadius: 22,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: '#231E2C',
   },
   focusCard: {
-    borderColor: 'rgba(217, 74, 140, 0.52)',
+    borderColor: 'rgba(217,74,140,0.48)',
     shadowColor: '#D94A8C',
     shadowOffset: { width: 0, height: 0 },
     shadowOpacity: 0.22,
     shadowRadius: 18,
+    elevation: 8,
   },
   cardGradient: { padding: 16 },
   cardHeader: { flexDirection: 'row', alignItems: 'flex-start', gap: 12 },
+
   avatar: {
     width: 68,
-    height: 78,
+    height: 80,
     borderRadius: 18,
     overflow: 'hidden',
     backgroundColor: '#2A2432',
     borderWidth: 1,
-    borderColor: 'rgba(217, 74, 140, 0.35)',
+    borderColor: 'rgba(217,74,140,0.32)',
   },
   avatarImage: { width: '100%', height: '100%' },
   lockOverlay: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(13, 11, 16, 0.34)',
+    backgroundColor: 'rgba(13,11,16,0.45)',
     alignItems: 'center',
     justifyContent: 'center',
   },
-  lockText: { color: '#FDFBF7', fontSize: 10, fontWeight: '900', letterSpacing: 1 },
+  lockIcon: { fontSize: 20 },
+
   profileInfo: { flex: 1, minWidth: 0 },
   nameRow: { flexDirection: 'row', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
-  profileName: { color: '#FDFBF7', fontSize: 19, fontWeight: '800' },
+  profileName: { color: '#FDFBF7', fontSize: 18, fontWeight: '800' },
   zkBadge: {
     borderWidth: 1,
     borderColor: '#4ade80',
-    backgroundColor: 'rgba(74, 222, 128, 0.12)',
-    borderRadius: 5,
+    backgroundColor: 'rgba(74,222,128,0.10)',
+    borderRadius: 6,
     paddingHorizontal: 6,
     paddingVertical: 2,
   },
   zkBadgeText: { color: '#4ade80', fontSize: 10, fontWeight: '800' },
-  location: { color: '#A299A8', fontSize: 12, marginTop: 4 },
-  bio: { color: '#D8D0DD', fontSize: 13, lineHeight: 18, marginTop: 6 },
-  lockedHint: { color: '#6D6175', fontSize: 12, marginTop: 7, fontWeight: '700' },
-  unlockedHint: { color: '#4ade80', fontSize: 12, marginTop: 7, fontWeight: '800' },
-  focusHint: { color: '#4ade80', fontSize: 12, marginTop: 7, fontWeight: '900' },
-  compatibilityPill: {
+  location: { color: '#7A7085', fontSize: 12, marginTop: 4 },
+  bio: { color: '#C8C0CE', fontSize: 13, lineHeight: 18, marginTop: 5 },
+
+  statusHint: { fontSize: 12, marginTop: 7, fontWeight: '700' },
+  hintGreen: { color: '#4ade80' },
+  hintMuted: { color: '#55505e' },
+
+  scorePill: {
     alignItems: 'center',
+    borderRadius: 14,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    backgroundColor: 'rgba(255,255,255,0.04)',
+    borderWidth: 1,
+  },
+  scoreValue: { fontSize: 15, fontWeight: '900' },
+  scoreLabel: { color: '#A299A8', fontSize: 10, marginTop: 1 },
+
+  divider: {
+    height: 1,
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    marginVertical: 14,
+  },
+
+  // Report box
+  reportBox: {
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: 'rgba(217,74,140,0.28)',
+    backgroundColor: 'rgba(217,74,140,0.06)',
+    padding: 14,
+    gap: 8,
+  },
+  reportTitle: { color: '#FDFBF7', fontSize: 12, fontWeight: '800', marginBottom: 2 },
+  reportLine: {
     borderRadius: 12,
     paddingHorizontal: 10,
     paddingVertical: 8,
-    backgroundColor: 'rgba(255, 255, 255, 0.05)',
-    borderWidth: 1,
-    borderColor: '#2A2432',
+    backgroundColor: 'rgba(13,11,16,0.55)',
+    flexDirection: 'row',
+    flexWrap: 'wrap',
   },
-  compatibilityValue: { color: '#FDFBF7', fontSize: 15, fontWeight: '800' },
-  compatibilityLabel: { color: '#A299A8', fontSize: 10, marginTop: 1 },
-  overheardBox: {
-    marginTop: 16,
-    padding: 12,
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: 'rgba(217, 74, 140, 0.38)',
-    backgroundColor: 'rgba(217, 74, 140, 0.08)',
-  },
-  overheardTitle: { color: '#FDFBF7', fontSize: 12, fontWeight: '800', marginBottom: 10 },
-  chatLine: {
-    borderRadius: 11,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    backgroundColor: 'rgba(13, 11, 16, 0.6)',
-    marginBottom: 8,
-  },
-  chatLineText: { color: '#E0DCE3', fontSize: 12, lineHeight: 17 },
-  blobId: {
-    color: '#6D6175',
+  reportLineRisk: { borderWidth: 1, borderColor: 'rgba(248,113,113,0.2)' },
+  reportLineOpener: { borderWidth: 1, borderColor: 'rgba(74,222,128,0.2)' },
+  reportLineMuted: { color: '#7A7085', fontSize: 12, fontWeight: '700' },
+  reportLineText: { color: '#DDD6E0', fontSize: 12, lineHeight: 17, flex: 1 },
+
+  refText: {
+    color: '#4A4356',
     fontSize: 11,
-    marginTop: 12,
+    marginTop: 10,
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
   },
+
+  // Card actions
   actionRow: { marginTop: 14, gap: 10 },
   passButton: {
     height: 46,
     borderRadius: 15,
     borderWidth: 1,
-    borderColor: '#3A3342',
+    borderColor: '#302840',
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: 'rgba(255, 255, 255, 0.04)',
+    backgroundColor: 'rgba(255,255,255,0.03)',
   },
-  passButtonText: { color: '#E0DCE3', fontSize: 15, fontWeight: '700' },
-  chatButton: { height: 48, borderRadius: 16, overflow: 'hidden' },
+  passButtonText: { color: '#C0B8C8', fontSize: 14, fontWeight: '700' },
+  chatButtonWrap: { height: 50, borderRadius: 16, overflow: 'hidden' },
   chatButtonGradient: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   chatButtonText: { color: '#FFF', fontSize: 15, fontWeight: '800' },
-  emptyState: { marginTop: 80, alignItems: 'center' },
-  emptyTitle: { color: '#FDFBF7', fontSize: 20, fontWeight: '800' },
-  emptyText: { color: '#A299A8', fontSize: 14, marginTop: 8, textAlign: 'center' },
+
+  // Empty state
+  emptyState: { marginTop: 60, alignItems: 'center', paddingHorizontal: 24 },
+  emptyTitle: { color: '#FDFBF7', fontSize: 20, fontWeight: '800', textAlign: 'center' },
+  emptyBody: {
+    color: '#A299A8',
+    fontSize: 14,
+    marginTop: 8,
+    textAlign: 'center',
+    lineHeight: 20,
+  },
 });
