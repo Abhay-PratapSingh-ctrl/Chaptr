@@ -1,5 +1,7 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  ActivityIndicator,
+  Alert,
   FlatList,
   KeyboardAvoidingView,
   Platform,
@@ -13,6 +15,34 @@ import {
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { LinearGradient } from 'expo-linear-gradient';
 import { router, useLocalSearchParams } from 'expo-router';
+import * as WebBrowser from 'expo-web-browser';
+import * as AuthSession from 'expo-auth-session';
+import { getZkLoginSignature } from '@mysten/sui/zklogin';
+import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
+import { buildSendHumanMessageTx } from '@/utils/suiTransactions';
+import { fetchJsonFromWalrus, uploadJsonToWalrus } from '@/utils/walrusService';
+import {
+  fetchZkProof,
+  loadZkLoginParams,
+  setupZkLoginParams,
+} from '@/utils/zkLoginService';
+
+WebBrowser.maybeCompleteAuthSession();
+
+const GOOGLE_CLIENT_ID = process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID || '';
+const CHAT_PACKAGE_ID = process.env.EXPO_PUBLIC_CHAT_PACKAGE_ID || '';
+const CHAT_ZK_SESSION_KEY = 'chaptr:chat-zk-session';
+
+const HUMAN_MATCHES_KEY = 'chaptr:human-matches';
+
+const suiClient = new SuiJsonRpcClient({
+  url: getJsonRpcFullnodeUrl('testnet'),
+  network: 'testnet',
+});
+
+const discovery = {
+  authorizationEndpoint: 'https://accounts.google.com/o/oauth2/v2/auth',
+};
 
 interface Message {
   id: string;
@@ -22,6 +52,7 @@ interface Message {
 }
 
 interface HumanMatch {
+  matchId?: string | null;
   proposalId: string;
   participantOwner: string;
   participantTwinId: string | null;
@@ -31,13 +62,31 @@ interface HumanMatch {
   acceptedDigest: string;
   createdAt: string;
 }
-
-const HUMAN_MATCHES_KEY = 'chaptr:human-matches';
+interface ChatZkSession {
+  ephemeralKeyPair: any;
+  maxEpoch: number;
+  zkProof: any;
+  addressSeed: string;
+  userAddress: string;
+}
 
 const firstParam = (value?: string | string[]) =>
   Array.isArray(value) ? value[0] : value;
 
 const humanChatKey = (matchId: string) => `chaptr:human-chat:${matchId}`;
+
+const sameAddress = (a?: string | null, b?: string | null) =>
+  Boolean(a && b && a.toLowerCase() === b.toLowerCase());
+
+const sameId = (a?: string | null, b?: string | null) =>
+  Boolean(a && b && a.toLowerCase() === b.toLowerCase());
+
+const toPlainString = (value: any): string => {
+  if (typeof value === 'string') return value;
+  if (value?.id && typeof value.id === 'string') return value.id;
+  if (value === null || value === undefined) return '';
+  return String(value);
+};
 
 const loadHumanMatch = async (matchId: string): Promise<HumanMatch | null> => {
   const raw = await AsyncStorage.getItem(HUMAN_MATCHES_KEY);
@@ -50,14 +99,120 @@ const loadHumanMatch = async (matchId: string): Promise<HumanMatch | null> => {
     return (
       parsed.find(
         (item) =>
+          sameId(item?.matchId, matchId) ||
           item?.proposalId === matchId ||
           item?.participantTwinId === matchId ||
-          item?.participantOwner === matchId,
+          sameAddress(item?.participantOwner, matchId),
       ) ?? null
     );
   } catch {
     return null;
   }
+};
+
+const getJwtForChatAction = async () => {
+  if (!GOOGLE_CLIENT_ID) {
+    throw new Error('Missing EXPO_PUBLIC_GOOGLE_CLIENT_ID');
+  }
+
+  const { nonce } = await setupZkLoginParams();
+  const redirectUri = AuthSession.makeRedirectUri();
+
+  const request = new AuthSession.AuthRequest({
+    clientId: GOOGLE_CLIENT_ID,
+    responseType: AuthSession.ResponseType.IdToken,
+    scopes: ['openid', 'email', 'profile'],
+    redirectUri,
+    extraParams: { nonce, prompt: 'select_account' },
+    usePKCE: false,
+  });
+
+  const result = await request.promptAsync(discovery);
+
+  if (result.type !== 'success') {
+    throw new Error('Google sign-in was cancelled');
+  }
+
+  const idToken = result.params.id_token;
+  if (!idToken) throw new Error('No id_token returned');
+
+  return idToken;
+};
+
+const executeWithZkLoginSession = async (tx: any, session: ChatZkSession) => {
+  tx.setSender(session.userAddress);
+
+  const { bytes, signature: userSignature } = await tx.sign({
+    client: suiClient,
+    signer: session.ephemeralKeyPair,
+  });
+
+  const zkSignature = getZkLoginSignature({
+    inputs: { ...(session.zkProof as any), addressSeed: session.addressSeed },
+    maxEpoch: session.maxEpoch,
+    userSignature,
+  });
+
+  return suiClient.executeTransactionBlock({
+    transactionBlock: bytes,
+    signature: zkSignature,
+    options: { showEffects: true, showEvents: true, showObjectChanges: true },
+  });
+};
+const loadChainMessages = async (
+  matchId: string,
+  myOwner: string | null,
+): Promise<Message[]> => {
+  if (!CHAT_PACKAGE_ID) return [];
+
+  const eventsResult = await suiClient.queryEvents({
+    query: {
+      MoveEventType: `${CHAT_PACKAGE_ID}::chat::MessageSent`,
+    },
+    limit: 50,
+    order: 'descending',
+  });
+
+  const rows = eventsResult.data ?? [];
+  const forMatch = rows.filter((event: any) => {
+    const parsed = event.parsedJson ?? {};
+    const eventMatchId = toPlainString(parsed.match_id ?? parsed.matchId);
+    return sameId(eventMatchId, matchId);
+  });
+
+  const messages: Message[] = [];
+
+  for (const [index, event] of forMatch.entries()) {
+    const parsed: any = event.parsedJson ?? {};
+    const blobId = toPlainString(parsed.blob_id ?? parsed.blobId);
+    const sender = toPlainString(parsed.sender);
+
+    try {
+      const payload = await fetchJsonFromWalrus<{
+        kind?: string;
+        matchId?: string;
+        text?: string;
+        createdAt?: string;
+        sender?: string;
+      }>(blobId);
+
+      if (!payload.text) continue;
+      if (payload.matchId && !sameId(payload.matchId, matchId)) continue;
+
+      messages.push({
+        id: `${event.id?.txDigest ?? 'tx'}-${event.id?.eventSeq ?? index}`,
+        text: payload.text,
+        sender: sameAddress(payload.sender || sender, myOwner) ? 'me' : 'them',
+        createdAt: payload.createdAt ?? new Date().toISOString(),
+      });
+    } catch {
+      // Skip unreadable Walrus blobs.
+    }
+  }
+
+  return messages.sort(
+    (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
+  );
 };
 
 export default function HumanChatScreen() {
@@ -69,10 +224,14 @@ export default function HumanChatScreen() {
   const matchId = firstParam(params.id) ?? 'unknown-match';
   const routeName = firstParam(params.name);
 
+  const [zkSession, setZkSession] = useState<ChatZkSession | null>(null);
   const [match, setMatch] = useState<HumanMatch | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputText, setInputText] = useState('');
   const [isLoading, setIsLoading] = useState(true);
+  const [isSending, setIsSending] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [myOwner, setMyOwner] = useState<string | null>(null);
 
   const listRef = useRef<FlatList<Message> | null>(null);
 
@@ -88,20 +247,71 @@ export default function HumanChatScreen() {
     [displayName],
   );
 
+  const refreshMessages = useCallback(async () => {
+    try {
+      setIsRefreshing(true);
+  
+      const owner = await AsyncStorage.getItem('chaptr:my-owner');
+      setMyOwner(owner);
+  
+      const chainMessages = await loadChainMessages(matchId, owner);
+  
+      setMessages((current) => {
+        const localMessages = current.filter((msg) => msg.id !== 'intro');
+        const merged = [...localMessages];
+  
+        for (const chainMessage of chainMessages) {
+          const alreadyExists = merged.some(
+            (msg) =>
+              msg.id === chainMessage.id ||
+              (
+                msg.text === chainMessage.text &&
+                msg.sender === chainMessage.sender &&
+                Math.abs(
+                  new Date(msg.createdAt).getTime() -
+                    new Date(chainMessage.createdAt).getTime(),
+                ) < 10_000
+              ),
+          );
+  
+          if (!alreadyExists) {
+            merged.push(chainMessage);
+          }
+        }
+  
+        merged.sort(
+          (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
+        );
+  
+        const nextMessages = [introMessage, ...merged];
+        AsyncStorage.setItem(humanChatKey(matchId), JSON.stringify(nextMessages)).catch(console.warn);
+        return nextMessages;
+      });
+    } catch (error) {
+      console.warn('Failed to refresh human chat:', error);
+    } finally {
+      setIsRefreshing(false);
+    }
+  }, [introMessage, matchId]);
+
   useEffect(() => {
     const load = async () => {
       try {
         setIsLoading(true);
 
-        const [savedChatRaw, savedMatch] = await Promise.all([
-          AsyncStorage.getItem(humanChatKey(matchId)),
+        const [savedMatch, savedChatRaw, owner] = await Promise.all([
           loadHumanMatch(matchId),
+          AsyncStorage.getItem(humanChatKey(matchId)),
+          AsyncStorage.getItem('chaptr:my-owner'),
         ]);
 
         setMatch(savedMatch);
+        setMyOwner(owner);
 
         const restored = savedChatRaw ? JSON.parse(savedChatRaw) : null;
         setMessages(Array.isArray(restored) ? restored : [introMessage]);
+
+        await refreshMessages();
       } catch (error) {
         console.warn('Failed to load human chat:', error);
         setMessages([introMessage]);
@@ -111,13 +321,16 @@ export default function HumanChatScreen() {
     };
 
     load();
-  }, [introMessage, matchId]);
-
+  }, [introMessage, matchId, refreshMessages])
   useEffect(() => {
-    if (isLoading || messages.length === 0) return;
-
-    AsyncStorage.setItem(humanChatKey(matchId), JSON.stringify(messages)).catch(console.warn);
-  }, [isLoading, matchId, messages]);
+    if (isLoading) return;
+  
+    const interval = setInterval(() => {
+      refreshMessages().catch(console.warn);
+    }, 1000);
+  
+    return () => clearInterval(interval);
+  }, [isLoading, refreshMessages]);;
 
   useEffect(() => {
     const timeout = setTimeout(() => {
@@ -127,25 +340,149 @@ export default function HumanChatScreen() {
     return () => clearTimeout(timeout);
   }, [messages]);
 
-  const handleSend = () => {
-    const trimmed = inputText.trim();
-    if (!trimmed) return;
+  const getChatZkSession = useCallback(async () => {
+    if (zkSession) return zkSession;
+  
+    const cachedRaw = await AsyncStorage.getItem(CHAT_ZK_SESSION_KEY);
+    if (cachedRaw) {
+      try {
+        const cached = JSON.parse(cachedRaw);
+        const { ephemeralKeyPair } = await loadZkLoginParams();
+  
+        const session: ChatZkSession = {
+          ephemeralKeyPair,
+          maxEpoch: Number(cached.maxEpoch),
+          zkProof: cached.zkProof,
+          addressSeed: cached.addressSeed,
+          userAddress: cached.userAddress,
+        };
+  
+        setZkSession(session);
+        return session;
+      } catch {
+        await AsyncStorage.removeItem(CHAT_ZK_SESSION_KEY);
+      }
+    }
+  
+    const jwt = await getJwtForChatAction();
+    const { ephemeralKeyPair, maxEpoch, randomness } = await loadZkLoginParams();
+    const { zkProof, addressSeed, userAddress } = await fetchZkProof(
+      jwt,
+      ephemeralKeyPair,
+      maxEpoch,
+      randomness,
+    );
+  
+    const expectedOwner = await AsyncStorage.getItem('chaptr:my-owner');
+  
+    if (!expectedOwner) {
+      throw new Error('Missing local Chaptr identity. Sign in again.');
+    }
+  
+    if (userAddress.toLowerCase() !== expectedOwner.toLowerCase()) {
+      throw new Error("Selected Google account does not match this browser's Chaptr identity.");
+    }
+  
+    const session: ChatZkSession = {
+      ephemeralKeyPair,
+      maxEpoch: Number(maxEpoch),
+      zkProof,
+      addressSeed,
+      userAddress,
+    };
+  
+    await AsyncStorage.setItem(
+      CHAT_ZK_SESSION_KEY,
+      JSON.stringify({
+        maxEpoch: Number(maxEpoch),
+        zkProof,
+        addressSeed,
+        userAddress,
+      }),
+    );
+  
+    setZkSession(session);
+    return session;
+  }, [zkSession]);
 
-    const userMessage: Message = {
-      id: `${Date.now()}`,
+  const handleSend = async () => {
+    const trimmed = inputText.trim();
+    if (!trimmed || isSending) return;
+  
+    if (!CHAT_PACKAGE_ID) {
+      Alert.alert('Chat not connected', 'Set EXPO_PUBLIC_CHAT_PACKAGE_ID and restart Expo.');
+      return;
+    }
+  
+    if (!myOwner) {
+      Alert.alert('Not signed in', 'Create your Twin first to send messages.');
+      return;
+    }
+  
+    const createdAt = new Date().toISOString();
+  
+    const optimisticMessage: Message = {
+      id: `pending-${Date.now()}`,
       text: trimmed,
       sender: 'me',
-      createdAt: new Date().toISOString(),
+      createdAt,
     };
-
-    setMessages((current) => [...current, userMessage]);
-    setInputText('');
+  
+    try {
+      setIsSending(true);
+  
+      const session = await getChatZkSession();
+  
+      setMessages((current) => [...current, optimisticMessage]);
+      setInputText('');
+  
+      const payload = {
+        version: 1,
+        kind: 'chaptr-human-message',
+        matchId,
+        sender: myOwner,
+        text: trimmed,
+        createdAt,
+      };
+  
+      const blobId = await uploadJsonToWalrus(payload);
+      const tx = buildSendHumanMessageTx(matchId, blobId);
+  
+      await executeWithZkLoginSession(tx, session);
+  
+      const confirmedMessage: Message = {
+        id: `sent-${Date.now()}`,
+        text: trimmed,
+        sender: 'me',
+        createdAt,
+      };
+  
+      setMessages((current) => {
+        const withoutPending = current.filter((msg) => msg.id !== optimisticMessage.id);
+        const next = [...withoutPending, confirmedMessage];
+        AsyncStorage.setItem(humanChatKey(matchId), JSON.stringify(next)).catch(console.warn);
+        return next;
+      });
+  
+      setTimeout(() => {
+        refreshMessages().catch(console.warn);
+      }, 1000);
+    } catch (err: any) {
+      console.error('Send failed:', err);
+  
+      setMessages((current) => current.filter((msg) => msg.id !== optimisticMessage.id));
+  
+      Alert.alert('Send failed', err.message ?? 'Could not send message.');
+    } finally {
+      setIsSending(false);
+    }
   };
 
   if (isLoading) {
     return (
       <SafeAreaView style={styles.root}>
         <View style={styles.loading}>
+          <ActivityIndicator color="#D94A8C" />
           <Text style={styles.loadingText}>Opening human chat...</Text>
         </View>
       </SafeAreaView>
@@ -160,7 +497,7 @@ export default function HumanChatScreen() {
       >
         <View style={styles.header}>
           <TouchableOpacity onPress={() => router.back()} style={styles.backButton}>
-            <Text style={styles.backText}>← Back</Text>
+            <Text style={styles.backText}>{'< Back'}</Text>
           </TouchableOpacity>
 
           <View style={styles.headerCenter}>
@@ -168,13 +505,22 @@ export default function HumanChatScreen() {
             <Text style={styles.mode}>Human Match</Text>
           </View>
 
-          <View style={styles.headerSpacer} />
+          <TouchableOpacity
+            onPress={refreshMessages}
+            style={styles.headerAction}
+            disabled={isRefreshing || isSending}
+          >
+            <Text style={styles.refreshText}>{isRefreshing ? 'Syncing' : 'Sync'}</Text>
+          </TouchableOpacity>
         </View>
 
         <View style={styles.matchBanner}>
           <Text style={styles.bannerKicker}>Match Mode</Text>
           <Text style={styles.bannerText}>
             Twins made the introduction. Now the conversation is yours.
+          </Text>
+          <Text style={styles.syncStatus}>
+            {CHAT_PACKAGE_ID ? 'Sui + Walrus sync active' : 'Chat package not connected'}
           </Text>
           {match?.acceptedDigest ? (
             <Text style={styles.digestText}>Tx: {match.acceptedDigest.slice(0, 18)}...</Text>
@@ -221,18 +567,19 @@ export default function HumanChatScreen() {
             placeholderTextColor="#6D6175"
             multiline
             maxLength={280}
+            editable={!isSending}
           />
 
           <TouchableOpacity
-            style={[styles.sendButton, !inputText.trim() && styles.sendButtonDisabled]}
+            style={[styles.sendButton, (!inputText.trim() || isSending) && styles.sendButtonDisabled]}
             onPress={handleSend}
-            disabled={!inputText.trim()}
+            disabled={!inputText.trim() || isSending}
           >
             <LinearGradient
-              colors={inputText.trim() ? ['#D94A8C', '#7A3EB8'] : ['#2A2432', '#2A2432']}
+              colors={inputText.trim() && !isSending ? ['#D94A8C', '#7A3EB8'] : ['#2A2432', '#2A2432']}
               style={styles.sendGradient}
             >
-              <Text style={styles.sendText}>Send</Text>
+              <Text style={styles.sendText}>{isSending ? 'Sending...' : 'Send'}</Text>
             </LinearGradient>
           </TouchableOpacity>
         </View>
@@ -244,7 +591,7 @@ export default function HumanChatScreen() {
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: '#0D0B10' },
   flex: { flex: 1 },
-  loading: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  loading: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 12 },
   loadingText: { color: '#A299A8', fontSize: 14 },
   header: {
     flexDirection: 'row',
@@ -259,7 +606,8 @@ const styles = StyleSheet.create({
   headerCenter: { flex: 1, alignItems: 'center' },
   name: { color: '#FDFBF7', fontSize: 18, fontWeight: '900' },
   mode: { color: '#4ade80', fontSize: 10, fontWeight: '900', letterSpacing: 1, marginTop: 3 },
-  headerSpacer: { width: 72 },
+  headerAction: { width: 72, alignItems: 'flex-end' },
+  refreshText: { color: '#A299A8', fontSize: 13, fontWeight: '800' },
   matchBanner: {
     margin: 14,
     padding: 14,
@@ -277,6 +625,7 @@ const styles = StyleSheet.create({
     marginBottom: 5,
   },
   bannerText: { color: '#D8D0DD', fontSize: 13, lineHeight: 18 },
+  syncStatus: { color: '#93c5fd', fontSize: 11, marginTop: 8, fontWeight: '800' },
   digestText: {
     color: '#6D6175',
     fontSize: 11,

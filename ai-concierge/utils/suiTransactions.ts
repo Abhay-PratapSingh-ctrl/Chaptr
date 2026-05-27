@@ -1,6 +1,7 @@
 import { Transaction } from '@mysten/sui/transactions';
 
 const PACKAGE_ID = process.env.EXPO_PUBLIC_PACKAGE_ID || '';
+const CHAT_PACKAGE_ID = process.env.EXPO_PUBLIC_CHAT_PACKAGE_ID || '';
 
 type SignAndExecute = (args: { transaction: Transaction }) => Promise<any>;
 
@@ -91,4 +92,29 @@ export const proposeSuiMatch = async (
   return signAndExecute({
     transaction: buildProposeMatchTx(myTwinId, targetAddress, score, message),
   });
+};
+
+export const buildSendHumanMessageTx = (matchId: string, blobId: string) => {
+  if (!CHAT_PACKAGE_ID) {
+    throw new Error('EXPO_PUBLIC_CHAT_PACKAGE_ID is not set');
+  }
+
+  const tx = new Transaction();
+
+  tx.moveCall({
+    target: `${CHAT_PACKAGE_ID}::chat::send_message`,
+    arguments: [tx.pure.address(matchId), tx.pure.string(blobId)],
+  });
+
+  return tx;
+};
+export const buildEndMatchTx = (matchId: string) => {
+  const tx = new Transaction();
+
+  tx.moveCall({
+    target: `${PACKAGE_ID}::matchmaker::end_match`,
+    arguments: [tx.object(matchId)],
+  });
+
+  return tx;
 };

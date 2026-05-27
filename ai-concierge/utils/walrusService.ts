@@ -3,6 +3,37 @@
 const PUBLISHER = 'https://publisher.walrus-testnet.walrus.space';
 const AGGREGATOR = 'https://aggregator.walrus-testnet.walrus.space';
 
+const extractBlobId = (result: any): string | null =>
+  result.newlyCreated?.blobObject?.blobId ?? result.alreadyCertified?.blobId ?? null;
+
+export const uploadJsonToWalrus = async (payload: unknown, epochs = 10): Promise<string> => {
+  const response = await fetch(`${PUBLISHER}/v1/blobs?epochs=${epochs}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Walrus upload failed: ${response.status} ${await response.text()}`);
+  }
+
+  const result = await response.json();
+  const blobId = extractBlobId(result);
+
+  if (!blobId) throw new Error(`No blobId in Walrus response: ${JSON.stringify(result)}`);
+  return blobId;
+};
+
+export const fetchJsonFromWalrus = async <T = any>(blobId: string): Promise<T> => {
+  const response = await fetch(`${AGGREGATOR}/v1/blobs/${encodeURIComponent(blobId)}`);
+
+  if (!response.ok) {
+    throw new Error(`Walrus fetch failed: ${response.status} ${await response.text()}`);
+  }
+
+  return response.json();
+};
+
 const encryptVector = (vector: number[], userAddress: string): string => {
   const key = userAddress.slice(2, 18);
   const json = JSON.stringify(vector);
