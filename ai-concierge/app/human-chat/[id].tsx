@@ -32,7 +32,6 @@ WebBrowser.maybeCompleteAuthSession();
 const GOOGLE_CLIENT_ID = process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID || '';
 const CHAT_PACKAGE_ID = process.env.EXPO_PUBLIC_CHAT_PACKAGE_ID || '';
 const CHAT_ZK_SESSION_KEY = 'chaptr:chat-zk-session';
-
 const HUMAN_MATCHES_KEY = 'chaptr:human-matches';
 
 const suiClient = new SuiJsonRpcClient({
@@ -62,6 +61,7 @@ interface HumanMatch {
   acceptedDigest: string;
   createdAt: string;
 }
+
 interface ChatZkSession {
   ephemeralKeyPair: any;
   maxEpoch: number;
@@ -116,13 +116,12 @@ const getJwtForChatAction = async () => {
   }
 
   const { nonce } = await setupZkLoginParams();
-  const redirectUri = AuthSession.makeRedirectUri();
 
   const request = new AuthSession.AuthRequest({
     clientId: GOOGLE_CLIENT_ID,
     responseType: AuthSession.ResponseType.IdToken,
     scopes: ['openid', 'email', 'profile'],
-    redirectUri,
+    redirectUri: AuthSession.makeRedirectUri(),
     extraParams: { nonce, prompt: 'select_account' },
     usePKCE: false,
   });
@@ -159,6 +158,7 @@ const executeWithZkLoginSession = async (tx: any, session: ChatZkSession) => {
     options: { showEffects: true, showEvents: true, showObjectChanges: true },
   });
 };
+
 const loadChainMessages = async (
   matchId: string,
   myOwner: string | null,
@@ -232,6 +232,7 @@ export default function HumanChatScreen() {
   const [isSending, setIsSending] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [myOwner, setMyOwner] = useState<string | null>(null);
+  const [showSafetyTips, setShowSafetyTips] = useState(false);
 
   const listRef = useRef<FlatList<Message> | null>(null);
 
@@ -250,39 +251,37 @@ export default function HumanChatScreen() {
   const refreshMessages = useCallback(async () => {
     try {
       setIsRefreshing(true);
-  
+
       const owner = await AsyncStorage.getItem('chaptr:my-owner');
       setMyOwner(owner);
-  
+
       const chainMessages = await loadChainMessages(matchId, owner);
-  
+
       setMessages((current) => {
         const localMessages = current.filter((msg) => msg.id !== 'intro');
         const merged = [...localMessages];
-  
+
         for (const chainMessage of chainMessages) {
           const alreadyExists = merged.some(
             (msg) =>
               msg.id === chainMessage.id ||
-              (
-                msg.text === chainMessage.text &&
+              (msg.text === chainMessage.text &&
                 msg.sender === chainMessage.sender &&
                 Math.abs(
                   new Date(msg.createdAt).getTime() -
                     new Date(chainMessage.createdAt).getTime(),
-                ) < 10_000
-              ),
+                ) < 10_000),
           );
-  
+
           if (!alreadyExists) {
             merged.push(chainMessage);
           }
         }
-  
+
         merged.sort(
           (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
         );
-  
+
         const nextMessages = [introMessage, ...merged];
         AsyncStorage.setItem(humanChatKey(matchId), JSON.stringify(nextMessages)).catch(console.warn);
         return nextMessages;
@@ -321,16 +320,17 @@ export default function HumanChatScreen() {
     };
 
     load();
-  }, [introMessage, matchId, refreshMessages])
+  }, [introMessage, matchId, refreshMessages]);
+
   useEffect(() => {
     if (isLoading) return;
-  
+
     const interval = setInterval(() => {
       refreshMessages().catch(console.warn);
     }, 1000);
-  
+
     return () => clearInterval(interval);
-  }, [isLoading, refreshMessages]);;
+  }, [isLoading, refreshMessages]);
 
   useEffect(() => {
     const timeout = setTimeout(() => {
@@ -341,24 +341,51 @@ export default function HumanChatScreen() {
   }, [messages]);
 
   const getChatZkSession = useCallback(async () => {
-    if (zkSession) return zkSession;
+    const expectedOwner = await AsyncStorage.getItem('chaptr:my-owner');
+  
+    if (!expectedOwner) {
+      throw new Error('Missing local Chaptr identity. Sign in again.');
+    }
+  
+    const systemState = await suiClient.getLatestSuiSystemState();
+    const currentEpoch = Number(systemState.epoch);
+  
+    if (
+      zkSession &&
+      zkSession.userAddress.toLowerCase() === expectedOwner.toLowerCase() &&
+      Number(zkSession.maxEpoch) > currentEpoch
+    ) {
+      return zkSession;
+    }
   
     const cachedRaw = await AsyncStorage.getItem(CHAT_ZK_SESSION_KEY);
+  
     if (cachedRaw) {
       try {
         const cached = JSON.parse(cachedRaw);
-        const { ephemeralKeyPair } = await loadZkLoginParams();
+        const cachedAddress = String(cached.userAddress ?? '');
+        const cachedMaxEpoch = Number(cached.maxEpoch);
   
-        const session: ChatZkSession = {
-          ephemeralKeyPair,
-          maxEpoch: Number(cached.maxEpoch),
-          zkProof: cached.zkProof,
-          addressSeed: cached.addressSeed,
-          userAddress: cached.userAddress,
-        };
+        if (
+          cachedAddress.toLowerCase() === expectedOwner.toLowerCase() &&
+          Number.isFinite(cachedMaxEpoch) &&
+          cachedMaxEpoch > currentEpoch
+        ) {
+          const { ephemeralKeyPair } = await loadZkLoginParams();
   
-        setZkSession(session);
-        return session;
+          const session: ChatZkSession = {
+            ephemeralKeyPair,
+            maxEpoch: cachedMaxEpoch,
+            zkProof: cached.zkProof,
+            addressSeed: cached.addressSeed,
+            userAddress: cachedAddress,
+          };
+  
+          setZkSession(session);
+          return session;
+        }
+  
+        await AsyncStorage.removeItem(CHAT_ZK_SESSION_KEY);
       } catch {
         await AsyncStorage.removeItem(CHAT_ZK_SESSION_KEY);
       }
@@ -372,12 +399,6 @@ export default function HumanChatScreen() {
       maxEpoch,
       randomness,
     );
-  
-    const expectedOwner = await AsyncStorage.getItem('chaptr:my-owner');
-  
-    if (!expectedOwner) {
-      throw new Error('Missing local Chaptr identity. Sign in again.');
-    }
   
     if (userAddress.toLowerCase() !== expectedOwner.toLowerCase()) {
       throw new Error("Selected Google account does not match this browser's Chaptr identity.");
@@ -408,34 +429,34 @@ export default function HumanChatScreen() {
   const handleSend = async () => {
     const trimmed = inputText.trim();
     if (!trimmed || isSending) return;
-  
+
     if (!CHAT_PACKAGE_ID) {
       Alert.alert('Chat not connected', 'Set EXPO_PUBLIC_CHAT_PACKAGE_ID and restart Expo.');
       return;
     }
-  
+
     if (!myOwner) {
       Alert.alert('Not signed in', 'Create your Twin first to send messages.');
       return;
     }
-  
+
     const createdAt = new Date().toISOString();
-  
+
     const optimisticMessage: Message = {
       id: `pending-${Date.now()}`,
       text: trimmed,
       sender: 'me',
       createdAt,
     };
-  
+
     try {
       setIsSending(true);
-  
+
       const session = await getChatZkSession();
-  
+
       setMessages((current) => [...current, optimisticMessage]);
       setInputText('');
-  
+
       const payload = {
         version: 1,
         kind: 'chaptr-human-message',
@@ -444,39 +465,58 @@ export default function HumanChatScreen() {
         text: trimmed,
         createdAt,
       };
-  
+
       const blobId = await uploadJsonToWalrus(payload);
       const tx = buildSendHumanMessageTx(matchId, blobId);
-  
+
       await executeWithZkLoginSession(tx, session);
-  
+
       const confirmedMessage: Message = {
         id: `sent-${Date.now()}`,
         text: trimmed,
         sender: 'me',
         createdAt,
       };
-  
+
       setMessages((current) => {
         const withoutPending = current.filter((msg) => msg.id !== optimisticMessage.id);
         const next = [...withoutPending, confirmedMessage];
         AsyncStorage.setItem(humanChatKey(matchId), JSON.stringify(next)).catch(console.warn);
         return next;
       });
-  
+
       setTimeout(() => {
         refreshMessages().catch(console.warn);
       }, 1000);
     } catch (err: any) {
       console.error('Send failed:', err);
-  
+
       setMessages((current) => current.filter((msg) => msg.id !== optimisticMessage.id));
-  
+
       Alert.alert('Send failed', err.message ?? 'Could not send message.');
     } finally {
       setIsSending(false);
     }
   };
+
+  const openReflection = useCallback(
+    (initialBlock = '0') => {
+      router.push({
+        pathname: '/reflection' as any,
+        params: {
+          source: 'human-chat',
+          matchId,
+          proposalId: match?.proposalId ?? '',
+          targetOwner: match?.participantOwner ?? '',
+          targetTwinId: match?.participantTwinId ?? '',
+          targetName: displayName,
+          score: String(match?.score ?? ''),
+          initialBlock,
+        },
+      });
+    },
+    [displayName, match, matchId],
+  );
 
   if (isLoading) {
     return (
@@ -505,13 +545,19 @@ export default function HumanChatScreen() {
             <Text style={styles.mode}>Human Match</Text>
           </View>
 
-          <TouchableOpacity
-            onPress={refreshMessages}
-            style={styles.headerAction}
-            disabled={isRefreshing || isSending}
-          >
-            <Text style={styles.refreshText}>{isRefreshing ? 'Syncing' : 'Sync'}</Text>
-          </TouchableOpacity>
+          <View style={styles.headerActions}>
+            <TouchableOpacity onPress={() => openReflection('1')} style={styles.headerAction}>
+              <Text style={styles.blockHeaderText}>Block</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              onPress={refreshMessages}
+              style={styles.headerAction}
+              disabled={isRefreshing || isSending}
+            >
+              <Text style={styles.refreshText}>{isRefreshing ? 'Syncing' : 'Sync'}</Text>
+            </TouchableOpacity>
+          </View>
         </View>
 
         <View style={styles.matchBanner}>
@@ -525,6 +571,27 @@ export default function HumanChatScreen() {
           {match?.acceptedDigest ? (
             <Text style={styles.digestText}>Tx: {match.acceptedDigest.slice(0, 18)}...</Text>
           ) : null}
+
+          <TouchableOpacity
+            onPress={() => setShowSafetyTips((value) => !value)}
+            style={styles.safetyToggle}
+          >
+            <Text style={styles.safetyToggleText}>
+              {showSafetyTips ? 'Hide safety hints' : 'Show safety hints'}
+            </Text>
+          </TouchableOpacity>
+
+          {showSafetyTips ? (
+            <View style={styles.safetyHints}>
+              <Text style={styles.safetyHint}>Never share personal contact info before you feel ready.</Text>
+              <Text style={styles.safetyHint}>If something feels off, trust that signal.</Text>
+              <Text style={styles.safetyHint}>No one should pressure you to move off-platform.</Text>
+            </View>
+          ) : null}
+
+          <TouchableOpacity onPress={() => openReflection('0')} style={styles.endMatchInline}>
+            <Text style={styles.endMatchInlineText}>End Match</Text>
+          </TouchableOpacity>
         </View>
 
         <FlatList
@@ -606,7 +673,9 @@ const styles = StyleSheet.create({
   headerCenter: { flex: 1, alignItems: 'center' },
   name: { color: '#FDFBF7', fontSize: 18, fontWeight: '900' },
   mode: { color: '#4ade80', fontSize: 10, fontWeight: '900', letterSpacing: 1, marginTop: 3 },
-  headerAction: { width: 72, alignItems: 'flex-end' },
+  headerActions: { width: 112, flexDirection: 'row', justifyContent: 'flex-end', gap: 10 },
+  headerAction: { alignItems: 'flex-end' },
+  blockHeaderText: { color: '#fca5a5', fontSize: 13, fontWeight: '900' },
   refreshText: { color: '#A299A8', fontSize: 13, fontWeight: '800' },
   matchBanner: {
     margin: 14,
@@ -632,6 +701,29 @@ const styles = StyleSheet.create({
     marginTop: 8,
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
   },
+  safetyToggle: { marginTop: 12 },
+  safetyToggleText: { color: '#f9a8d4', fontSize: 12, fontWeight: '900' },
+  safetyHints: {
+    marginTop: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(217,74,140,0.25)',
+    backgroundColor: 'rgba(217,74,140,0.06)',
+    padding: 10,
+    gap: 6,
+  },
+  safetyHint: { color: '#D8D0DD', fontSize: 12, lineHeight: 17 },
+  endMatchInline: {
+    marginTop: 12,
+    height: 40,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(248,113,113,0.45)',
+    backgroundColor: 'rgba(248,113,113,0.07)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  endMatchInlineText: { color: '#fecaca', fontSize: 13, fontWeight: '900' },
   chatContent: { paddingHorizontal: 16, paddingBottom: 16, gap: 10 },
   messageWrap: { maxWidth: '84%' },
   meWrap: { alignSelf: 'flex-end' },

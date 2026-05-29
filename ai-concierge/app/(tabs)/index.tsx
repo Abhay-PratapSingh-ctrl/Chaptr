@@ -19,12 +19,17 @@ import * as AuthSession from 'expo-auth-session';
 import { Transaction } from '@mysten/sui/transactions';
 import { getZkLoginSignature } from '@mysten/sui/zklogin';
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
-import { buildEndMatchTx, buildWithdrawProposalTx } from '@/utils/suiTransactions';
+import { buildWithdrawProposalTx } from '@/utils/suiTransactions';
 import {
   fetchZkProof,
   loadZkLoginParams,
   setupZkLoginParams,
 } from '@/utils/zkLoginService';
+import {
+  readBlockedProfileKeys,
+  readHiddenProfileIds,
+  writeFeedback,
+} from '@/utils/safetyService';
 import {
   formatScoutCapsuleForPrompt,
   loadLocalScoutCapsule,
@@ -38,6 +43,7 @@ const TWIN_POOL_ID = process.env.EXPO_PUBLIC_TWIN_POOL_ID || '';
 const PACKAGE_ID = process.env.EXPO_PUBLIC_PACKAGE_ID || '';
 const GEMINI_API_KEY = process.env.EXPO_PUBLIC_GEMINI_API_KEY || '';
 const GEMINI_MODEL = process.env.EXPO_PUBLIC_GEMINI_MODEL || 'gemini-2.5-flash-lite';
+const REPORT_FEEDBACK_KEY = 'chaptr:report-feedback-ids';
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -51,6 +57,14 @@ const PASSED_PROFILES_KEY = 'chaptr:passed-profiles';
 const UNLOCKED_PROFILES_KEY = 'chaptr:unlocked-profiles';
 const ACTIVE_PROPOSAL_KEY = 'chaptr:active-proposal';
 const HUMAN_MATCHES_KEY = 'chaptr:human-matches';
+
+type ReportAccuracySignal = 'accurate' | 'somewhat_accurate' | 'not_accurate';
+
+const REPORT_FEEDBACK_OPTIONS: { label: string; signal: ReportAccuracySignal }[] = [
+  { label: 'Accurate', signal: 'accurate' },
+  { label: 'Somewhat', signal: 'somewhat_accurate' },
+  { label: 'Missed', signal: 'not_accurate' },
+];
 
 const sameAddress = (a?: string | null, b?: string | null) =>
   Boolean(a && b && a.toLowerCase() === b.toLowerCase());
@@ -170,6 +184,7 @@ const showNotice = (title: string, message: string) => {
     window.alert(`${title}\n\n${message}`);
     return;
   }
+
   Alert.alert(title, message);
 };
 
@@ -179,6 +194,7 @@ const confirmAction = (title: string, message: string) =>
       resolve(window.confirm(`${title}\n\n${message}`));
       return;
     }
+
     Alert.alert(title, message, [
       { text: 'Cancel', style: 'cancel', onPress: () => resolve(false) },
       { text: 'Continue', style: 'destructive', onPress: () => resolve(true) },
@@ -275,15 +291,9 @@ const parseAcceptedEvent = (event: any): AcceptedMatchEvent | null => {
   const parsed = event.parsedJson ?? {};
 
   return {
-    proposalId:
-      firstValue(parsed.proposal_id, parsed.proposalId, parsed.proposal?.id) || null,
+    proposalId: firstValue(parsed.proposal_id, parsed.proposalId, parsed.proposal?.id) || null,
     matchId:
-      firstValue(
-        parsed.match_id,
-        parsed.matchId,
-        parsed.match?.id,
-        parsed.id,
-      ) || null,
+      firstValue(parsed.match_id, parsed.matchId, parsed.match?.id, parsed.id) || null,
     from:
       firstValue(
         parsed.from,
@@ -337,6 +347,7 @@ const syncActiveProposalAcceptance = async (
 
   if (!proposalId) {
     proposalId = await fetchProposalIdFromDigest(syncedProposal.digest).catch(() => null);
+
     if (proposalId) {
       syncedProposal = { ...syncedProposal, proposalId };
       await AsyncStorage.setItem(ACTIVE_PROPOSAL_KEY, JSON.stringify(syncedProposal));
@@ -347,6 +358,7 @@ const syncActiveProposalAcceptance = async (
     .map(parseAcceptedEvent)
     .find((event) => {
       if (!event) return false;
+
       const sameProposal = Boolean(proposalId && event.proposalId === proposalId);
       const samePair =
         (sameAddress(event.from, myOwner) &&
@@ -844,7 +856,6 @@ const entryToProfile = (entry: PoolEntry, scout: ScoutProfile): Profile => {
   };
 };
 
-// ─── Avatar initial helper ────────────────────────────────────────────────────
 const getInitial = (name: string) => (name ?? '?').charAt(0).toUpperCase();
 
 export default function MorningBriefingScreen() {
@@ -858,7 +869,10 @@ export default function MorningBriefingScreen() {
   const [error, setError] = useState<string | null>(null);
   const [isWithdrawing, setIsWithdrawing] = useState(false);
   const [isLoggingOut, setIsLoggingOut] = useState(false);
-  const [isEndingMatch, setIsEndingMatch] = useState(false);
+  const [reportFeedbackIds, setReportFeedbackIds] = useState<string[]>([]);
+  const [isWritingReportFeedback, setIsWritingReportFeedback] = useState<string | null>(null);
+
+  const isEndingMatch = false;
 
   const loadPoolProfiles = useCallback(async () => {
     setIsLoading(true);
@@ -872,6 +886,8 @@ export default function MorningBriefingScreen() {
         myInterestedIn,
         storedMyScoutRef,
         localScoutCapsule,
+        blockedKeys,
+        hiddenProfileIds,
       ] = await Promise.all([
         fetchPoolEntries(),
         AsyncStorage.getItem('chaptr:my-owner'),
@@ -879,7 +895,12 @@ export default function MorningBriefingScreen() {
         AsyncStorage.getItem('chaptr:my-interested-in'),
         AsyncStorage.getItem('chaptr:my-scout-ref'),
         loadLocalScoutCapsule(),
+        readBlockedProfileKeys(),
+        readHiddenProfileIds(),
       ]);
+
+      const blockedKeySet = new Set(blockedKeys.map((key) => key.toLowerCase()));
+      const hiddenProfileIdSet = new Set(hiddenProfileIds.map((id) => id.toLowerCase()));
 
       if (entries.length === 0) {
         setProfiles([]);
@@ -887,7 +908,7 @@ export default function MorningBriefingScreen() {
       }
 
       const myPoolEntry = myOwner
-        ? entries.find((entry) => entry.owner === myOwner)
+        ? entries.find((entry) => sameAddress(entry.owner, myOwner))
         : null;
 
       const myScoutRef = storedMyScoutRef || myPoolEntry?.scout_ref || null;
@@ -896,13 +917,27 @@ export default function MorningBriefingScreen() {
       const myScout = fetchedMyScout
         ? {
             ...fetchedMyScout,
-            scoutCapsule: fetchedMyScout.scoutCapsule ?? localScoutCapsule ?? undefined,
+            scoutCapsule: {
+              ...(fetchedMyScout.scoutCapsule ?? localScoutCapsule ?? undefined),
+              feedbackHistory:
+                localScoutCapsule?.feedbackHistory ??
+                fetchedMyScout.scoutCapsule?.feedbackHistory,
+            } as ScoutCapsule,
           }
         : null;
 
       const settled = await Promise.allSettled(
         entries.map(async (entry) => {
-          if (myOwner && entry.owner === myOwner) return null;
+          if (myOwner && sameAddress(entry.owner, myOwner)) return null;
+
+          const entryKeys = [entry.owner, entry.twin_id].map((value) => value.toLowerCase());
+
+          if (
+            entryKeys.some((key) => blockedKeySet.has(key)) ||
+            hiddenProfileIdSet.has(entry.twin_id.toLowerCase())
+          ) {
+            return null;
+          }
 
           const scout = await fetchScoutProfile(entry.scout_ref);
 
@@ -947,15 +982,16 @@ export default function MorningBriefingScreen() {
   }, []);
 
   const loadSavedState = useCallback(async () => {
-    const [passed, unlocked, proposal, myOwner] = await Promise.all([
+    const [passed, unlocked, proposal, myOwner, reportFeedback] = await Promise.all([
       readStringArray(PASSED_PROFILES_KEY),
       readStringArray(UNLOCKED_PROFILES_KEY),
       readActiveProposal(),
       AsyncStorage.getItem('chaptr:my-owner'),
+      readStringArray(REPORT_FEEDBACK_KEY),
     ]);
 
-    // Chain-first match discovery: works for both proposer and receiver in any browser.
-    // Falls back to local storage if chain is unreachable.
+    setReportFeedbackIds(reportFeedback);
+
     const chainMatches = myOwner
       ? await syncHumanMatchesFromSui(myOwner).catch((err) => {
           console.warn('[loadSavedState] chain sync failed, reading local:', err);
@@ -963,10 +999,9 @@ export default function MorningBriefingScreen() {
         })
       : await readHumanMatches();
 
-    // Still run the existing proposal-acceptance sync on top, passing chain matches in.
     const synced = await syncActiveProposalAcceptance(proposal, chainMatches, myOwner).catch(
-      (error) => {
-        console.warn('Accepted match sync failed:', error);
+      (syncError) => {
+        console.warn('Accepted match sync failed:', syncError);
         return { proposal, matches: chainMatches };
       },
     );
@@ -1002,8 +1037,8 @@ export default function MorningBriefingScreen() {
       };
 
       setIsLoading(true);
-      loadScreen().catch((error) => {
-        console.warn(error);
+      loadScreen().catch((loadError) => {
+        console.warn(loadError);
         setHasLocalTwin(false);
         setIsLoading(false);
       });
@@ -1011,7 +1046,7 @@ export default function MorningBriefingScreen() {
   );
 
   const topConnections = useMemo(
-    () => profiles.filter((p) => !passedProfileIds.includes(p.id)),
+    () => profiles.filter((profile) => !passedProfileIds.includes(profile.id)),
     [profiles, passedProfileIds],
   );
 
@@ -1053,6 +1088,10 @@ export default function MorningBriefingScreen() {
 
   const openProposals = () => {
     router.push('/proposals' as Href);
+  };
+
+  const openTraining = () => {
+    router.push('/twin-training' as Href);
   };
 
   const openActiveProposal = () => {
@@ -1119,9 +1158,7 @@ export default function MorningBriefingScreen() {
       const proposalId = await resolveActiveProposalId(activeProposal);
 
       if (!proposalId) {
-        throw new Error(
-          'Could not find the proposal object ID. Send app/chat/[id].tsx so we can store proposalId when proposing.',
-        );
+        throw new Error('Could not find the proposal object ID.');
       }
 
       const jwt = await getJwtForTransaction();
@@ -1133,8 +1170,8 @@ export default function MorningBriefingScreen() {
       setActiveProposal(null);
 
       showNotice('Proposal withdrawn', 'Your Twin is free to focus on someone new.');
-    } catch (error: any) {
-      showNotice('Withdraw failed', error?.message ?? 'Could not withdraw proposal.');
+    } catch (withdrawError: any) {
+      showNotice('Withdraw failed', withdrawError?.message ?? 'Could not withdraw proposal.');
     } finally {
       setIsWithdrawing(false);
     }
@@ -1193,45 +1230,62 @@ export default function MorningBriefingScreen() {
 
     const confirmed = await confirmAction(
       'End current match?',
-      `This ends your match with ${activeHumanMatch.participantName} and releases both Twins.`,
+      `This opens a short reflection, then releases both Twins from your match with ${activeHumanMatch.participantName}.`,
     );
 
     if (!confirmed) return;
 
-    setIsEndingMatch(true);
+    router.push({
+      pathname: '/reflection' as any,
+      params: {
+        source: 'morning-briefing',
+        matchId,
+        proposalId: activeHumanMatch.proposalId,
+        targetOwner: activeHumanMatch.participantOwner,
+        targetTwinId: activeHumanMatch.participantTwinId ?? '',
+        targetName: activeHumanMatch.participantName,
+        score: String(activeHumanMatch.score ?? ''),
+      },
+    });
+  }, [activeHumanMatch]);
 
+  const handleReportAccuracyFeedback = async (
+    profile: Profile,
+    signal: ReportAccuracySignal,
+  ) => {
     try {
-      const myOwner = await AsyncStorage.getItem('chaptr:my-owner');
-      if (!myOwner) throw new Error('Missing local owner address.');
+      setIsWritingReportFeedback(profile.id);
 
-      const jwt = await getJwtForTransaction();
-      const tx = buildEndMatchTx(matchId);
+      await writeFeedback({
+        type: 'report_accuracy',
+        signal,
+        targetTwinId: profile.id,
+        targetOwner: profile.owner,
+        targetName: profile.name,
+        score: profile.compatibility,
+        note: profile.report?.summary,
+      });
 
-      await executeZkLoginTransaction(tx, myOwner, jwt);
-
-      const nextMatches = humanMatches.filter(
-        (match) =>
-          (match.matchId ?? match.proposalId) !==
-          (activeHumanMatch.matchId ?? activeHumanMatch.proposalId),
-      );
-
-      await AsyncStorage.setItem(HUMAN_MATCHES_KEY, JSON.stringify(nextMatches));
-      setHumanMatches(nextMatches);
-
-      showNotice('Match ended', 'Both Twins are free again.');
-    } catch (error: any) {
-      showNotice('End match failed', error?.message ?? 'Could not end this match.');
+      setReportFeedbackIds((prev) => {
+        const next = Array.from(new Set([...prev, profile.id]));
+        AsyncStorage.setItem(REPORT_FEEDBACK_KEY, JSON.stringify(next)).catch(console.warn);
+        return next;
+      });
+    } catch (feedbackError) {
+      console.warn('Report feedback failed:', feedbackError);
+      showNotice('Feedback failed', 'Could not save this scout report signal.');
     } finally {
-      setIsEndingMatch(false);
+      setIsWritingReportFeedback(null);
     }
-  }, [activeHumanMatch, humanMatches]);
+  };
 
-  // ─── Profile card renderer ──────────────────────────────────────────────────
   const renderProfileCard = ({ item, index }: { item: Profile; index: number }) => {
     const isTopCard = index === 0;
     const isUnlocked = unlockedProfileIds.includes(item.id);
     const isFocusedProfile = activeProposal?.candidateTwinId === item.id;
     const humanMatch = findHumanMatchForProfile(humanMatches, item);
+    const hasReportFeedback = reportFeedbackIds.includes(item.id);
+    const isSavingReportFeedback = isWritingReportFeedback === item.id;
 
     const scoreColor =
       item.compatibility >= 85 ? '#4ade80' : item.compatibility >= 70 ? '#D94A8C' : '#A299A8';
@@ -1248,9 +1302,7 @@ export default function MorningBriefingScreen() {
           end={{ x: 1, y: 1 }}
           style={styles.cardGradient}
         >
-          {/* Top section */}
           <View style={styles.cardHeader}>
-            {/* Avatar */}
             <View style={styles.avatar}>
               <Image
                 source={{ uri: item.photoUrl }}
@@ -1264,31 +1316,27 @@ export default function MorningBriefingScreen() {
               )}
             </View>
 
-            {/* Info */}
             <View style={styles.profileInfo}>
               <View style={styles.nameRow}>
                 <Text style={styles.profileName}>
-                  {item.name}{item.age > 0 ? `, ${item.age}` : ''}
+                  {item.name}
+                  {item.age > 0 ? `, ${item.age}` : ''}
                 </Text>
                 <View style={styles.zkBadge}>
                   <Text style={styles.zkBadgeText}>ZK</Text>
                 </View>
               </View>
 
-              {item.location ? (
-                <Text style={styles.location}>📍 {item.location}</Text>
-              ) : null}
+              {item.location ? <Text style={styles.location}>📍 {item.location}</Text> : null}
 
-              <Text style={styles.bio} numberOfLines={2}>{item.bio}</Text>
+              <Text style={styles.bio} numberOfLines={2}>
+                {item.bio}
+              </Text>
 
               <Text
                 style={[
                   styles.statusHint,
-                  humanMatch
-                    ? styles.hintGreen
-                    : isFocusedProfile
-                    ? styles.hintGreen
-                    : isUnlocked
+                  humanMatch || isFocusedProfile || isUnlocked
                     ? styles.hintGreen
                     : styles.hintMuted,
                 ]}
@@ -1296,14 +1344,13 @@ export default function MorningBriefingScreen() {
                 {humanMatch
                   ? '✦ Human match — open chat'
                   : isFocusedProfile
-                  ? '✦ Your Twin is focused here'
-                  : isUnlocked
-                  ? '✦ Human profile unlocked'
-                  : '· Chat to unlock profile'}
+                    ? '✦ Your Twin is focused here'
+                    : isUnlocked
+                      ? '✦ Human profile unlocked'
+                      : '· Chat to unlock profile'}
               </Text>
             </View>
 
-            {/* Score pill */}
             <View style={[styles.scorePill, { borderColor: scoreColor + '55' }]}>
               <Text style={[styles.scoreValue, { color: scoreColor }]}>
                 {item.compatibility}%
@@ -1312,12 +1359,10 @@ export default function MorningBriefingScreen() {
             </View>
           </View>
 
-          {/* Expanded content for top card */}
           {isTopCard && (
             <>
               <View style={styles.divider} />
 
-              {/* Scout report / Overheard */}
               <View style={styles.reportBox}>
                 {item.report ? (
                   <>
@@ -1347,6 +1392,39 @@ export default function MorningBriefingScreen() {
                       <Text style={styles.reportLineMuted}>Opener: </Text>
                       <Text style={styles.reportLineText}>{item.report.suggestedOpener}</Text>
                     </View>
+
+                    <View style={styles.reportFeedbackBox}>
+                      {hasReportFeedback ? (
+                        <Text style={styles.reportFeedbackDone}>
+                          Your Twin learned from this report.
+                        </Text>
+                      ) : (
+                        <>
+                          <Text style={styles.reportFeedbackTitle}>
+                            Was this scout report accurate?
+                          </Text>
+
+                          <View style={styles.reportFeedbackActions}>
+                            {REPORT_FEEDBACK_OPTIONS.map((option) => (
+                              <TouchableOpacity
+                                key={option.signal}
+                                style={[
+                                  styles.reportFeedbackButton,
+                                  isSavingReportFeedback && styles.reportFeedbackButtonDisabled,
+                                ]}
+                                onPress={() => handleReportAccuracyFeedback(item, option.signal)}
+                                disabled={isSavingReportFeedback}
+                                activeOpacity={0.8}
+                              >
+                                <Text style={styles.reportFeedbackButtonText}>
+                                  {isSavingReportFeedback ? 'Saving...' : option.label}
+                                </Text>
+                              </TouchableOpacity>
+                            ))}
+                          </View>
+                        </>
+                      )}
+                    </View>
                   </>
                 ) : (
                   <>
@@ -1367,7 +1445,6 @@ export default function MorningBriefingScreen() {
                 {item.reportRef ? ` · Report: ${item.reportRef.slice(0, 14)}…` : ''}
               </Text>
 
-              {/* Action buttons */}
               <View style={styles.actionRow}>
                 <TouchableOpacity
                   style={styles.passButton}
@@ -1396,10 +1473,10 @@ export default function MorningBriefingScreen() {
                       {humanMatch
                         ? 'Open Human Chat'
                         : isFocusedProfile
-                        ? 'Open Focus Chat'
-                        : isUnlocked
-                        ? 'Continue Chat'
-                        : 'Chat with Agent'}
+                          ? 'Open Focus Chat'
+                          : isUnlocked
+                            ? 'Continue Chat'
+                            : 'Chat with Agent'}
                     </Text>
                   </LinearGradient>
                 </TouchableOpacity>
@@ -1411,7 +1488,6 @@ export default function MorningBriefingScreen() {
     );
   };
 
-  // ─── Loading state ──────────────────────────────────────────────────────────
   if (isLoading) {
     return (
       <SafeAreaView style={styles.root}>
@@ -1423,7 +1499,6 @@ export default function MorningBriefingScreen() {
     );
   }
 
-  // ─── No twin ────────────────────────────────────────────────────────────────
   if (hasLocalTwin === false) {
     return (
       <SafeAreaView style={styles.root}>
@@ -1453,15 +1528,21 @@ export default function MorningBriefingScreen() {
     );
   }
 
-  // ─── Main screen ────────────────────────────────────────────────────────────
   return (
     <SafeAreaView style={styles.root}>
       <View style={styles.container}>
-
-        {/* Header */}
         <View style={styles.headerRow}>
           <Text style={styles.logoText}>Chaptr.</Text>
+
           <View style={styles.headerActions}>
+            <TouchableOpacity
+              style={styles.pillButton}
+              onPress={openTraining}
+              activeOpacity={0.85}
+            >
+              <Text style={styles.pillButtonText}>Training</Text>
+            </TouchableOpacity>
+
             <TouchableOpacity
               style={styles.pillButton}
               onPress={openProposals}
@@ -1483,7 +1564,6 @@ export default function MorningBriefingScreen() {
           </View>
         </View>
 
-        {/* ── Current Match Banner ── */}
         {activeHumanMatch ? (
           <View style={styles.matchBannerOuter}>
             <LinearGradient
@@ -1492,7 +1572,6 @@ export default function MorningBriefingScreen() {
               end={{ x: 1, y: 1 }}
               style={styles.matchBannerGradient}
             >
-              {/* Top row: label + LIVE pill */}
               <View style={styles.matchBannerTopRow}>
                 <Text style={styles.matchBannerKicker}>CURRENT MATCH</Text>
                 <View style={styles.livePill}>
@@ -1501,17 +1580,18 @@ export default function MorningBriefingScreen() {
                 </View>
               </View>
 
-              {/* Avatar + name row */}
               <View style={styles.matchIdentityRow}>
                 <View style={styles.matchAvatar}>
                   <Text style={styles.matchAvatarInitial}>
                     {getInitial(activeHumanMatch.participantName)}
                   </Text>
                 </View>
+
                 <View style={styles.matchIdentityText}>
                   <Text style={styles.matchBannerName}>
                     {activeHumanMatch.participantName} is your current chapter.
                   </Text>
+
                   <View style={styles.matchMetaRow}>
                     <View style={styles.metaPill}>
                       <Text style={styles.metaPillText}>1 active match</Text>
@@ -1523,7 +1603,6 @@ export default function MorningBriefingScreen() {
                 </View>
               </View>
 
-              {/* Actions */}
               <View style={styles.matchBannerActions}>
                 <TouchableOpacity
                   style={styles.matchChatButtonWrap}
@@ -1554,7 +1633,6 @@ export default function MorningBriefingScreen() {
             </LinearGradient>
           </View>
         ) : activeProposal ? (
-          /* ── Focus Mode Banner ── */
           <View style={styles.focusBannerOuter}>
             <LinearGradient
               colors={['rgba(74,222,128,0.10)', 'rgba(13,11,16,0.97)']}
@@ -1598,7 +1676,6 @@ export default function MorningBriefingScreen() {
           </View>
         ) : null}
 
-        {/* ── Morning Briefing header ── */}
         <View style={styles.briefingHeaderRow}>
           <View>
             <Text style={styles.briefingTitle}>Your Morning Briefing</Text>
@@ -1608,6 +1685,7 @@ export default function MorningBriefingScreen() {
                 : 'Your Agent is waiting for compatible Twins to join the pool.'}
             </Text>
           </View>
+
           <Text style={styles.briefingClock}>
             {new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
           </Text>
@@ -1615,14 +1693,13 @@ export default function MorningBriefingScreen() {
 
         {error ? <Text style={styles.errorText}>{error}</Text> : null}
 
-        {/* ── Profile list ── */}
         <FlatList
           data={topConnections}
           keyExtractor={(item) => item.id}
           renderItem={renderProfileCard}
           contentContainerStyle={styles.listContent}
           showsVerticalScrollIndicator={false}
-          extraData={`${passedProfileIds.join(',')}-${unlockedProfileIds.join(',')}-${humanMatches.map((m) => m.matchId ?? m.proposalId).join(',')}-${activeProposal?.candidateTwinId ?? ''}`}
+          extraData={`${passedProfileIds.join(',')}-${unlockedProfileIds.join(',')}-${humanMatches.map((m) => m.matchId ?? m.proposalId).join(',')}-${activeProposal?.candidateTwinId ?? ''}-${reportFeedbackIds.join(',')}-${isWritingReportFeedback ?? ''}`}
           ListEmptyComponent={
             !error ? (
               <View style={styles.emptyState}>
@@ -1639,15 +1716,10 @@ export default function MorningBriefingScreen() {
   );
 }
 
-// ─── Styles ───────────────────────────────────────────────────────────────────
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: '#0D0B10' },
-
-  // Loading
   loadingContainer: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 14 },
   loadingText: { color: '#A299A8', fontSize: 14, letterSpacing: 0.3 },
-
-  // No session
   noSessionContainer: {
     flex: 1,
     maxWidth: 520,
@@ -1672,8 +1744,6 @@ const styles = StyleSheet.create({
   primaryButtonWrap: { height: 52, borderRadius: 18, overflow: 'hidden' },
   primaryButtonGradient: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   primaryButtonText: { color: '#FFF', fontSize: 16, fontWeight: '800' },
-
-  // Main layout
   container: {
     flex: 1,
     maxWidth: 620,
@@ -1682,13 +1752,12 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingTop: 12,
   },
-
-  // Header row
   headerRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
     marginBottom: 16,
+    gap: 12,
   },
   logoText: {
     color: '#FDFBF7',
@@ -1697,7 +1766,12 @@ const styles = StyleSheet.create({
     fontFamily: Platform.OS === 'ios' ? 'Georgia' : 'serif',
     letterSpacing: 0.4,
   },
-  headerActions: { flexDirection: 'row', gap: 8 },
+  headerActions: {
+    flexDirection: 'row',
+    gap: 8,
+    flexWrap: 'wrap',
+    justifyContent: 'flex-end',
+  },
   pillButton: {
     borderWidth: 1,
     borderColor: '#2A2432',
@@ -1709,36 +1783,26 @@ const styles = StyleSheet.create({
   pillButtonText: { color: '#A299A8', fontSize: 12, fontWeight: '700' },
   pillButtonDanger: { borderColor: 'rgba(248,113,113,0.35)' },
   pillButtonDangerText: { color: '#f87171' },
-
-  // ── Current Match Banner ──────────────────────────────────────────────────
   matchBannerOuter: {
     borderRadius: 22,
     overflow: 'hidden',
     borderWidth: 1,
     borderColor: 'rgba(74,222,128,0.38)',
     marginBottom: 18,
-    // shadow
     shadowColor: '#4ade80',
     shadowOffset: { width: 0, height: 0 },
     shadowOpacity: 0.18,
     shadowRadius: 16,
     elevation: 8,
   },
-  matchBannerGradient: {
-    padding: 18,
-  },
+  matchBannerGradient: { padding: 18 },
   matchBannerTopRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
     marginBottom: 14,
   },
-  matchBannerKicker: {
-    color: '#4ade80',
-    fontSize: 11,
-    fontWeight: '900',
-    letterSpacing: 2,
-  },
+  matchBannerKicker: { color: '#4ade80', fontSize: 11, fontWeight: '900', letterSpacing: 2 },
   livePill: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1750,24 +1814,9 @@ const styles = StyleSheet.create({
     paddingVertical: 4,
     backgroundColor: 'rgba(74,222,128,0.10)',
   },
-  liveDot: {
-    width: 6,
-    height: 6,
-    borderRadius: 3,
-    backgroundColor: '#4ade80',
-  },
-  livePillText: {
-    color: '#4ade80',
-    fontSize: 10,
-    fontWeight: '900',
-    letterSpacing: 1.5,
-  },
-  matchIdentityRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 14,
-    marginBottom: 16,
-  },
+  liveDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: '#4ade80' },
+  livePillText: { color: '#4ade80', fontSize: 10, fontWeight: '900', letterSpacing: 1.5 },
+  matchIdentityRow: { flexDirection: 'row', alignItems: 'center', gap: 14, marginBottom: 16 },
   matchAvatar: {
     width: 52,
     height: 52,
@@ -1778,11 +1827,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  matchAvatarInitial: {
-    color: '#FDFBF7',
-    fontSize: 22,
-    fontWeight: '900',
-  },
+  matchAvatarInitial: { color: '#FDFBF7', fontSize: 22, fontWeight: '900' },
   matchIdentityText: { flex: 1 },
   matchBannerName: {
     color: '#FDFBF7',
@@ -1791,10 +1836,7 @@ const styles = StyleSheet.create({
     lineHeight: 22,
     marginBottom: 8,
   },
-  matchMetaRow: {
-    flexDirection: 'row',
-    gap: 8,
-  },
+  matchMetaRow: { flexDirection: 'row', gap: 8 },
   metaPill: {
     borderRadius: 999,
     borderWidth: 1,
@@ -1803,15 +1845,8 @@ const styles = StyleSheet.create({
     paddingHorizontal: 9,
     paddingVertical: 3,
   },
-  metaPillText: {
-    color: '#a7f3d0',
-    fontSize: 11,
-    fontWeight: '700',
-  },
-  matchBannerActions: {
-    flexDirection: 'row',
-    gap: 10,
-  },
+  metaPillText: { color: '#a7f3d0', fontSize: 11, fontWeight: '700' },
+  matchBannerActions: { flexDirection: 'row', gap: 10 },
   matchChatButtonWrap: {
     flex: 2,
     height: 48,
@@ -1823,17 +1858,8 @@ const styles = StyleSheet.create({
     shadowRadius: 12,
     elevation: 6,
   },
-  matchChatGradient: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  matchChatText: {
-    color: '#FFF',
-    fontSize: 14,
-    fontWeight: '900',
-    letterSpacing: 0.3,
-  },
+  matchChatGradient: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  matchChatText: { color: '#FFF', fontSize: 14, fontWeight: '900', letterSpacing: 0.3 },
   endMatchButton: {
     flex: 1,
     height: 48,
@@ -1844,13 +1870,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  endMatchText: {
-    color: '#fca5a5',
-    fontSize: 13,
-    fontWeight: '900',
-  },
-
-  // ── Focus Banner ──────────────────────────────────────────────────────────
+  endMatchText: { color: '#fca5a5', fontSize: 13, fontWeight: '900' },
   focusBannerOuter: {
     borderRadius: 20,
     overflow: 'hidden',
@@ -1865,12 +1885,7 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     marginBottom: 8,
   },
-  focusKicker: {
-    color: '#4ade80',
-    fontSize: 11,
-    fontWeight: '900',
-    letterSpacing: 2,
-  },
+  focusKicker: { color: '#4ade80', fontSize: 11, fontWeight: '900', letterSpacing: 2 },
   focusBadge: {
     borderRadius: 999,
     borderWidth: 1,
@@ -1905,8 +1920,6 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(248,113,113,0.08)',
   },
   focusActionSecondaryText: { color: '#fecaca', fontSize: 13, fontWeight: '800' },
-
-  // ── Briefing header ────────────────────────────────────────────────────────
   briefingHeaderRow: {
     flexDirection: 'row',
     alignItems: 'flex-start',
@@ -1914,11 +1927,7 @@ const styles = StyleSheet.create({
     marginBottom: 14,
     gap: 10,
   },
-  briefingTitle: {
-    color: '#FDFBF7',
-    fontSize: 24,
-    fontWeight: '800',
-  },
+  briefingTitle: { color: '#FDFBF7', fontSize: 24, fontWeight: '800' },
   briefingSubtitle: {
     color: '#A299A8',
     fontSize: 13,
@@ -1933,12 +1942,8 @@ const styles = StyleSheet.create({
     letterSpacing: 0.8,
     marginTop: 4,
   },
-
   errorText: { color: '#D94A8C', fontSize: 13, textAlign: 'center', marginBottom: 10 },
-
-  // ── Profile list ───────────────────────────────────────────────────────────
   listContent: { paddingBottom: 32, gap: 14 },
-
   card: {
     borderRadius: 22,
     overflow: 'hidden',
@@ -1955,7 +1960,6 @@ const styles = StyleSheet.create({
   },
   cardGradient: { padding: 16 },
   cardHeader: { flexDirection: 'row', alignItems: 'flex-start', gap: 12 },
-
   avatar: {
     width: 68,
     height: 80,
@@ -1973,7 +1977,6 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   lockIcon: { fontSize: 20 },
-
   profileInfo: { flex: 1, minWidth: 0 },
   nameRow: { flexDirection: 'row', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
   profileName: { color: '#FDFBF7', fontSize: 18, fontWeight: '800' },
@@ -1988,11 +1991,9 @@ const styles = StyleSheet.create({
   zkBadgeText: { color: '#4ade80', fontSize: 10, fontWeight: '800' },
   location: { color: '#7A7085', fontSize: 12, marginTop: 4 },
   bio: { color: '#C8C0CE', fontSize: 13, lineHeight: 18, marginTop: 5 },
-
   statusHint: { fontSize: 12, marginTop: 7, fontWeight: '700' },
   hintGreen: { color: '#4ade80' },
   hintMuted: { color: '#55505e' },
-
   scorePill: {
     alignItems: 'center',
     borderRadius: 14,
@@ -2003,14 +2004,11 @@ const styles = StyleSheet.create({
   },
   scoreValue: { fontSize: 15, fontWeight: '900' },
   scoreLabel: { color: '#A299A8', fontSize: 10, marginTop: 1 },
-
   divider: {
     height: 1,
     backgroundColor: 'rgba(255,255,255,0.06)',
     marginVertical: 14,
   },
-
-  // Report box
   reportBox: {
     borderRadius: 16,
     borderWidth: 1,
@@ -2032,15 +2030,52 @@ const styles = StyleSheet.create({
   reportLineOpener: { borderWidth: 1, borderColor: 'rgba(74,222,128,0.2)' },
   reportLineMuted: { color: '#7A7085', fontSize: 12, fontWeight: '700' },
   reportLineText: { color: '#DDD6E0', fontSize: 12, lineHeight: 17, flex: 1 },
-
+  reportFeedbackBox: {
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255,255,255,0.06)',
+    marginTop: 10,
+    paddingTop: 10,
+  },
+  reportFeedbackTitle: {
+    color: '#A299A8',
+    fontSize: 12,
+    fontWeight: '800',
+    marginBottom: 8,
+  },
+  reportFeedbackActions: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  reportFeedbackButton: {
+    flex: 1,
+    minHeight: 36,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(217,74,140,0.34)',
+    backgroundColor: 'rgba(217,74,140,0.08)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 8,
+  },
+  reportFeedbackButtonDisabled: {
+    opacity: 0.55,
+  },
+  reportFeedbackButtonText: {
+    color: '#f9a8d4',
+    fontSize: 11,
+    fontWeight: '900',
+  },
+  reportFeedbackDone: {
+    color: '#4ade80',
+    fontSize: 12,
+    fontWeight: '900',
+  },
   refText: {
     color: '#4A4356',
     fontSize: 11,
     marginTop: 10,
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
   },
-
-  // Card actions
   actionRow: { marginTop: 14, gap: 10 },
   passButton: {
     height: 46,
@@ -2055,8 +2090,6 @@ const styles = StyleSheet.create({
   chatButtonWrap: { height: 50, borderRadius: 16, overflow: 'hidden' },
   chatButtonGradient: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   chatButtonText: { color: '#FFF', fontSize: 15, fontWeight: '800' },
-
-  // Empty state
   emptyState: { marginTop: 60, alignItems: 'center', paddingHorizontal: 24 },
   emptyTitle: { color: '#FDFBF7', fontSize: 20, fontWeight: '800', textAlign: 'center' },
   emptyBody: {

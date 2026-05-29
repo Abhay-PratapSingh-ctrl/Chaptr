@@ -22,6 +22,7 @@ import * as WebBrowser from 'expo-web-browser';
 import * as AuthSession from 'expo-auth-session';
 import { getZkLoginSignature } from '@mysten/sui/zklogin';
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
+import { writeFeedback } from '@/utils/safetyService';
 import {
   formatScoutCapsuleForPrompt,
   rememberChatSignal,
@@ -44,6 +45,8 @@ const AGGREGATOR = 'https://aggregator.walrus-testnet.walrus.space';
 const UNLOCKED_PROFILES_KEY = 'chaptr:unlocked-profiles';
 const ACTIVE_PROPOSAL_KEY = 'chaptr:active-proposal';
 const HUMAN_MATCHES_KEY = 'chaptr:human-matches';
+const CHAT_FEEDBACK_KEY = 'chaptr:ai-chat-feedback';
+const chatFeedbackKey = (profileId: string) => `${CHAT_FEEDBACK_KEY}:${profileId}`;
 
 const sameAddress = (a?: string | null, b?: string | null) =>
   Boolean(a && b && a.toLowerCase() === b.toLowerCase());
@@ -68,7 +71,6 @@ const loadHumanMatchForProfile = async (profileId: string, owner: string) => {
     return null;
   }
 };
-
 const chatKeyForProfile = (profileId: string) => `chaptr:chat:${profileId}`;
 
 const suiClient = new SuiJsonRpcClient({
@@ -294,7 +296,6 @@ export default function ChatScreen() {
     mode?: string | string[];
     proposalId?: string | string[];
   }>();
-
   const profileId = firstParam(params.id) ?? 'unknown-profile';
   const scoutRef = firstParam(params.scoutRef);
   const routeName = firstParam(params.name);
@@ -315,6 +316,9 @@ export default function ChatScreen() {
   const [isRestoringChat, setIsRestoringChat] = useState(true);
   const [isProposing, setIsProposing] = useState(false);
   const [activeProposal, setActiveProposal] = useState<ActiveProposal | null>(null);
+  
+  const [chatFeedbackSubmitted, setChatFeedbackSubmitted] = useState(false);
+  const [isWritingChatFeedback, setIsWritingChatFeedback] = useState(false);
 
   const flatListRef = useRef<FlatList<Message> | null>(null);
 
@@ -324,6 +328,21 @@ export default function ChatScreen() {
       .catch(console.warn);
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+  
+    setChatFeedbackSubmitted(false);
+  
+    AsyncStorage.getItem(chatFeedbackKey(profileId))
+      .then((saved) => {
+        if (!cancelled) setChatFeedbackSubmitted(Boolean(saved));
+      })
+      .catch(console.warn);
+  
+    return () => {
+      cancelled = true;
+    };
+  }, [profileId]);
   useEffect(() => {
     let cancelled = false;
 
@@ -547,6 +566,30 @@ export default function ChatScreen() {
     setIsTyping(false);
   };
 
+  const handleChatFeedback = async (signal: 'good_fit' | 'not_for_me') => {
+    if (!persona || isWritingChatFeedback) return;
+  
+    try {
+      setIsWritingChatFeedback(true);
+  
+      await writeFeedback({
+        type: 'ai_chat',
+        signal,
+        targetTwinId: profileId,
+        targetOwner: owner,
+        targetName: persona.name,
+        score: routeScore,
+      });
+  
+      await AsyncStorage.setItem(chatFeedbackKey(profileId), signal);
+      setChatFeedbackSubmitted(true);
+    } catch (error) {
+      console.warn('Chat feedback failed:', error);
+      Alert.alert('Feedback failed', 'Could not save this signal. Try again later.');
+    } finally {
+      setIsWritingChatFeedback(false);
+    }
+  };
   const handleProposeMatch = async () => {
     if (!persona || isProposing) return;
 
@@ -729,7 +772,28 @@ export default function ChatScreen() {
             ) : null
           }
         />
+        {isUnlocked && !chatFeedbackSubmitted ? (
+  <View style={styles.chatFeedbackBox}>
+    <Text style={styles.chatFeedbackTitle}>Did this conversation feel worth your time?</Text>
+    <View style={styles.chatFeedbackActions}>
+      <TouchableOpacity
+        style={styles.chatFeedbackButton}
+        onPress={() => handleChatFeedback('good_fit')}
+        disabled={isWritingChatFeedback}
+      >
+        <Text style={styles.chatFeedbackText}>Yes, more like this</Text>
+      </TouchableOpacity>
 
+      <TouchableOpacity
+        style={styles.chatFeedbackButtonMuted}
+        onPress={() => handleChatFeedback('not_for_me')}
+        disabled={isWritingChatFeedback}
+      >
+        <Text style={styles.chatFeedbackTextMuted}>No, not for me</Text>
+      </TouchableOpacity>
+    </View>
+  </View>
+) : null}
         {isUnlocked && (
           <View style={styles.unlockedActions}>
             <TouchableOpacity
@@ -1025,4 +1089,34 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   closeProfileText: { color: '#FDFBF7', fontSize: 15, fontWeight: '700' },
+  chatFeedbackBox: {
+    marginHorizontal: 16,
+    marginBottom: 10,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: 'rgba(217,74,140,0.28)',
+    backgroundColor: 'rgba(217,74,140,0.06)',
+    padding: 12,
+    gap: 10,
+  },
+  chatFeedbackTitle: { color: '#FDFBF7', fontSize: 13, fontWeight: '900' },
+  chatFeedbackActions: { flexDirection: 'row', gap: 8 },
+  chatFeedbackButton: {
+    flex: 1,
+    borderRadius: 12,
+    backgroundColor: '#D94A8C',
+    paddingVertical: 10,
+    alignItems: 'center',
+  },
+  chatFeedbackButtonMuted: {
+    flex: 1,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#302840',
+    backgroundColor: 'rgba(255,255,255,0.04)',
+    paddingVertical: 10,
+    alignItems: 'center',
+  },
+  chatFeedbackText: { color: '#fff', fontSize: 12, fontWeight: '900' },
+  chatFeedbackTextMuted: { color: '#C8C0CE', fontSize: 12, fontWeight: '900' },
 });

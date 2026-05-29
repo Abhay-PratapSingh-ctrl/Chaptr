@@ -18,6 +18,7 @@ import * as WebBrowser from 'expo-web-browser';
 import * as AuthSession from 'expo-auth-session';
 import { getZkLoginSignature } from '@mysten/sui/zklogin';
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
+import { readBlockedProfileKeys, writeBlockEntry } from '@/utils/safetyService';
 import {
   buildAcceptProposalTx,
   buildRejectProposalTx,
@@ -79,8 +80,6 @@ interface IncomingProposal {
   proposerPhotoUrl: string;
 }
 
-// ─── Helpers (unchanged logic) ────────────────────────────────────────────────
-
 const blobUrl = (blobId: string) =>
   `${AGGREGATOR}/v1/blobs/${encodeURIComponent(blobId)}`;
 
@@ -116,9 +115,23 @@ const extractMatchIdFromResult = (result: any): string | null => {
 const sameAddress = (a?: string | null, b?: string | null) =>
   Boolean(a && b && a.toLowerCase() === b.toLowerCase());
 
+const confirmBlock = (title: string, message: string) =>
+  new Promise<boolean>((resolve) => {
+    if (Platform.OS === 'web' && typeof window !== 'undefined') {
+      resolve(window.confirm(`${title}\n\n${message}`));
+      return;
+    }
+
+    Alert.alert(title, message, [
+      { text: 'Cancel', style: 'cancel', onPress: () => resolve(false) },
+      { text: 'Block', style: 'destructive', onPress: () => resolve(true) },
+    ]);
+  });
+
 const readStringArray = async (key: string): Promise<string[]> => {
   const raw = await AsyncStorage.getItem(key);
   if (!raw) return [];
+
   try {
     const value = JSON.parse(raw);
     return Array.isArray(value) ? value.filter((item) => typeof item === 'string') : [];
@@ -146,6 +159,7 @@ const fetchPoolEntries = async (): Promise<PoolEntry[]> => {
 
   return raw.map((entry) => {
     const f = entry.fields ?? entry;
+
     return {
       twin_id: toPlainString(f.twin_id),
       owner: toPlainString(f.owner),
@@ -190,8 +204,10 @@ const getJwtForProposalAction = async () => {
 
   const result = await request.promptAsync(discovery);
   if (result.type !== 'success') throw new Error('Google sign-in was cancelled');
+
   const idToken = result.params.id_token;
   if (!idToken) throw new Error('No id_token returned');
+
   return idToken;
 };
 
@@ -206,8 +222,9 @@ const executeWithZkLogin = async (tx: any) => {
   );
 
   const expectedOwner = await AsyncStorage.getItem('chaptr:my-owner');
+
   if (expectedOwner && userAddress.toLowerCase() !== expectedOwner.toLowerCase()) {
-    throw new Error('Selected Google account does not match this browser\u2019s Chaptr identity.');
+    throw new Error("Selected Google account does not match this browser's Chaptr identity.");
   }
 
   tx.setSender(userAddress);
@@ -230,14 +247,10 @@ const executeWithZkLogin = async (tx: any) => {
   });
 };
 
-// ─── Initial helper ───────────────────────────────────────────────────────────
 const getInitial = (name: string) => (name ?? '?').charAt(0).toUpperCase();
 
-// ─── Score color ──────────────────────────────────────────────────────────────
 const scoreColor = (score: number) =>
   score >= 85 ? '#4ade80' : score >= 70 ? '#D94A8C' : '#A299A8';
-
-// ─── Component ────────────────────────────────────────────────────────────────
 
 export default function ProposalsScreen() {
   const [proposals, setProposals] = useState<IncomingProposal[]>([]);
@@ -251,22 +264,28 @@ export default function ProposalsScreen() {
 
     try {
       const myOwner = await AsyncStorage.getItem('chaptr:my-owner');
+
       if (!myOwner) {
         setProposals([]);
         setError('Create your Twin first to receive proposals.');
         return;
       }
 
-      const [eventsResult, poolEntries, hiddenProposalIds] = await Promise.all([
-        queryProposalEvents(),
-        fetchPoolEntries(),
-        readStringArray(HIDDEN_PROPOSALS_KEY),
-      ]);
+      const [eventsResult, poolEntries, hiddenProposalIds, blockedProfileKeys] =
+        await Promise.all([
+          queryProposalEvents(),
+          fetchPoolEntries(),
+          readStringArray(HIDDEN_PROPOSALS_KEY),
+          readBlockedProfileKeys(),
+        ]);
+
+      const blockedKeySet = new Set(blockedProfileKeys.map((key) => key.toLowerCase()));
 
       const eventRows = eventsResult.data ?? [];
       const incomingEvents = eventRows
         .map((event: any) => {
           const parsed = event.parsedJson ?? {};
+
           return {
             proposalId: toPlainString(parsed.proposal_id),
             from: toPlainString(parsed.from),
@@ -278,7 +297,8 @@ export default function ProposalsScreen() {
         })
         .filter((event) => event.proposalId)
         .filter((event) => sameAddress(event.to, myOwner))
-        .filter((event) => !hiddenProposalIds.includes(event.proposalId));
+        .filter((event) => !hiddenProposalIds.includes(event.proposalId))
+        .filter((event) => !blockedKeySet.has(event.from.toLowerCase()));
 
       const uniqueByProposal = new Map<string, typeof incomingEvents[number]>();
       incomingEvents.forEach((event) => uniqueByProposal.set(event.proposalId, event));
@@ -291,8 +311,7 @@ export default function ProposalsScreen() {
             : null;
 
           const proposerName =
-            scout?.displayName ||
-            `${event.from.slice(0, 6)}...${event.from.slice(-4)}`;
+            scout?.displayName || `${event.from.slice(0, 6)}...${event.from.slice(-4)}`;
 
           const proposerPhotoUrl = scout?.previewPhotoBlobId
             ? blobUrl(scout.previewPhotoBlobId)
@@ -313,7 +332,14 @@ export default function ProposalsScreen() {
         }),
       );
 
-      setProposals(resolved);
+      setProposals(
+        resolved.filter((proposal) => {
+          const ownerKey = proposal.from.toLowerCase();
+          const twinKey = proposal.proposerTwinId?.toLowerCase() ?? '';
+
+          return !blockedKeySet.has(ownerKey) && (!twinKey || !blockedKeySet.has(twinKey));
+        }),
+      );
     } catch (err: any) {
       console.error('Failed to load proposals:', err);
       setError(err.message ?? 'Could not load proposals.');
@@ -348,11 +374,55 @@ export default function ProposalsScreen() {
     });
   };
 
+  const handleBlock = async (proposal: IncomingProposal) => {
+    const confirmed = await confirmBlock(
+      'Block this person?',
+      'This hides their proposal and trains your Twin to avoid this profile.',
+    );
+
+    if (!confirmed) return;
+
+    try {
+      setActionId(proposal.proposalId);
+
+      await writeBlockEntry({
+        twinId: proposal.proposerTwinId,
+        ownerAddress: proposal.from,
+        name: proposal.proposerName,
+        reason: 'blocked_from_proposal',
+        note: `Blocked proposal ${proposal.proposalId}`,
+        matchId: null,
+      });
+
+      try {
+        const tx = buildRejectProposalTx(proposal.proposalId);
+        await executeWithZkLogin(tx);
+      } catch (error) {
+        console.warn('Block saved, but reject transaction failed:', error);
+      }
+
+      await writeUniqueString(HIDDEN_PROPOSALS_KEY, proposal.proposalId);
+
+      setProposals((current) =>
+        current.filter((item) => item.proposalId !== proposal.proposalId),
+      );
+
+      Alert.alert('Blocked', 'You will not see this proposal again.');
+    } catch (err: any) {
+      console.error('Block failed:', err);
+      Alert.alert('Block failed', err.message ?? 'Could not block this proposal.');
+    } finally {
+      setActionId(null);
+    }
+  };
+
   const handleReject = async (proposal: IncomingProposal) => {
     try {
       setActionId(proposal.proposalId);
+
       const tx = buildRejectProposalTx(proposal.proposalId);
       const result = await executeWithZkLogin(tx);
+
       await writeUniqueString(HIDDEN_PROPOSALS_KEY, proposal.proposalId);
 
       Alert.alert(
@@ -420,26 +490,22 @@ export default function ProposalsScreen() {
     }
   };
 
-  // ─── Loading ────────────────────────────────────────────────────────────────
   if (isLoading) {
     return (
       <SafeAreaView style={styles.root}>
         <View style={styles.loadingContainer}>
           <ActivityIndicator color="#D94A8C" size="large" />
-          <Text style={styles.loadingText}>Checking proposals…</Text>
+          <Text style={styles.loadingText}>Checking proposals...</Text>
         </View>
       </SafeAreaView>
     );
   }
 
-  // ─── Screen ─────────────────────────────────────────────────────────────────
   return (
     <SafeAreaView style={styles.root}>
-
-      {/* Header */}
       <View style={styles.header}>
         <TouchableOpacity onPress={() => router.back()} style={styles.backButton}>
-          <Text style={styles.backText}>← Back</Text>
+          <Text style={styles.backText}>{'< Back'}</Text>
         </TouchableOpacity>
 
         <Text style={styles.headerTitle}>Proposals</Text>
@@ -449,11 +515,7 @@ export default function ProposalsScreen() {
         </TouchableOpacity>
       </View>
 
-      <ScrollView
-        contentContainerStyle={styles.content}
-        showsVerticalScrollIndicator={false}
-      >
-        {/* Page heading */}
+      <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
         <Text style={styles.pageTitle}>Incoming Proposals</Text>
         <Text style={styles.pageSubtitle}>
           Talk to their Twin before accepting. Human chat opens only after you accept.
@@ -461,11 +523,10 @@ export default function ProposalsScreen() {
 
         {error ? <Text style={styles.errorText}>{error}</Text> : null}
 
-        {/* Empty state */}
         {proposals.length === 0 && !error ? (
           <View style={styles.emptyState}>
             <View style={styles.emptyIcon}>
-              <Text style={styles.emptyIconText}>✦</Text>
+              <Text style={styles.emptyIconText}>*</Text>
             </View>
             <Text style={styles.emptyTitle}>No proposals yet</Text>
             <Text style={styles.emptyBody}>
@@ -474,7 +535,6 @@ export default function ProposalsScreen() {
           </View>
         ) : null}
 
-        {/* Proposal cards */}
         {proposals.map((proposal) => {
           const isWorking = actionId === proposal.proposalId;
           const color = scoreColor(proposal.score || 86);
@@ -491,16 +551,9 @@ export default function ProposalsScreen() {
                 end={{ x: 1, y: 1 }}
                 style={styles.cardGradient}
               >
-                {/* ── Top: avatar + info + score ── */}
                 <View style={styles.cardTop}>
-
-                  {/* Avatar with initial fallback ring */}
                   <View style={styles.avatarWrap}>
-                    <Image
-                      source={{ uri: proposal.proposerPhotoUrl }}
-                      style={styles.avatarImage}
-                    />
-                    {/* Initial circle sits on top as a fallback feel indicator */}
+                    <Image source={{ uri: proposal.proposerPhotoUrl }} style={styles.avatarImage} />
                     <View style={styles.avatarInitialRing}>
                       <Text style={styles.avatarInitialText}>
                         {getInitial(proposal.proposerName)}
@@ -508,7 +561,6 @@ export default function ProposalsScreen() {
                     </View>
                   </View>
 
-                  {/* Profile info */}
                   <View style={styles.profileInfo}>
                     <Text style={styles.proposerName}>
                       {proposal.proposerName}
@@ -516,9 +568,7 @@ export default function ProposalsScreen() {
                     </Text>
 
                     {proposal.proposerLocation ? (
-                      <Text style={styles.proposerLocation}>
-                        📍 {proposal.proposerLocation}
-                      </Text>
+                      <Text style={styles.proposerLocation}>{proposal.proposerLocation}</Text>
                     ) : null}
 
                     <Text style={styles.proposerBio} numberOfLines={3}>
@@ -526,7 +576,6 @@ export default function ProposalsScreen() {
                     </Text>
                   </View>
 
-                  {/* Score pill */}
                   <View style={[styles.scorePill, { borderColor: color + '55' }]}>
                     <Text style={[styles.scoreValue, { color }]}>
                       {proposal.score || 86}%
@@ -535,10 +584,8 @@ export default function ProposalsScreen() {
                   </View>
                 </View>
 
-                {/* ── Divider ── */}
                 <View style={styles.divider} />
 
-                {/* ── Intent box ── */}
                 <View style={styles.intentBox}>
                   <View style={styles.intentTopRow}>
                     <Text style={styles.intentKicker}>FOCUS PROPOSAL</Text>
@@ -552,27 +599,29 @@ export default function ProposalsScreen() {
                   </Text>
                 </View>
 
-                {/* ── Proposal ref ── */}
                 <Text style={styles.refText}>
-                  Proposal: {proposal.proposalId.slice(0, 18)}…
+                  Proposal: {proposal.proposalId.slice(0, 18)}...
                 </Text>
 
-                {/* ── Actions ── */}
                 <View style={styles.actions}>
-
-                  {/* Reject */}
                   <TouchableOpacity
                     style={styles.rejectButton}
                     onPress={() => handleReject(proposal)}
                     disabled={isWorking}
                     activeOpacity={0.8}
                   >
-                    <Text style={styles.rejectText}>
-                      {isWorking ? '…' : 'Reject'}
-                    </Text>
+                    <Text style={styles.rejectText}>{isWorking ? '...' : 'Reject'}</Text>
                   </TouchableOpacity>
 
-                  {/* Talk to Twin */}
+                  <TouchableOpacity
+                    style={styles.blockButton}
+                    onPress={() => handleBlock(proposal)}
+                    disabled={isWorking}
+                    activeOpacity={0.8}
+                  >
+                    <Text style={styles.blockText}>{isWorking ? '...' : 'Block'}</Text>
+                  </TouchableOpacity>
+
                   <TouchableOpacity
                     style={styles.talkButton}
                     onPress={() => handleTalkToTwin(proposal)}
@@ -582,7 +631,6 @@ export default function ProposalsScreen() {
                     <Text style={styles.talkText}>Talk to Twin</Text>
                   </TouchableOpacity>
 
-                  {/* Accept */}
                   <TouchableOpacity
                     style={styles.acceptButtonWrap}
                     onPress={() => handleAccept(proposal)}
@@ -595,9 +643,7 @@ export default function ProposalsScreen() {
                       end={{ x: 1, y: 0 }}
                       style={styles.acceptGradient}
                     >
-                      <Text style={styles.acceptText}>
-                        {isWorking ? 'Signing…' : 'Accept'}
-                      </Text>
+                      <Text style={styles.acceptText}>{isWorking ? 'Signing...' : 'Accept'}</Text>
                     </LinearGradient>
                   </TouchableOpacity>
                 </View>
@@ -610,14 +656,10 @@ export default function ProposalsScreen() {
   );
 }
 
-// ─── Styles ───────────────────────────────────────────────────────────────────
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: '#0D0B10' },
-
   loadingContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: 14 },
   loadingText: { color: '#A299A8', fontSize: 14 },
-
-  // Header
   header: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -638,8 +680,6 @@ const styles = StyleSheet.create({
   },
   refreshButton: { width: 72, alignItems: 'flex-end' },
   refreshText: { color: '#A299A8', fontSize: 13, fontWeight: '700' },
-
-  // Content
   content: {
     maxWidth: 620,
     alignSelf: 'center',
@@ -657,8 +697,6 @@ const styles = StyleSheet.create({
     marginBottom: 22,
   },
   errorText: { color: '#D94A8C', fontSize: 13, marginBottom: 12 },
-
-  // Empty state
   emptyState: { alignItems: 'center', marginTop: 80, paddingHorizontal: 24 },
   emptyIcon: {
     width: 56,
@@ -680,8 +718,6 @@ const styles = StyleSheet.create({
     marginTop: 8,
     lineHeight: 20,
   },
-
-  // Card
   card: {
     borderRadius: 22,
     borderWidth: 1,
@@ -695,11 +731,7 @@ const styles = StyleSheet.create({
     elevation: 6,
   },
   cardGradient: { padding: 16 },
-
-  // Card top row
   cardTop: { flexDirection: 'row', gap: 12, alignItems: 'flex-start' },
-
-  // Avatar
   avatarWrap: {
     width: 68,
     height: 82,
@@ -710,31 +742,18 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(217,74,140,0.35)',
     position: 'relative',
   },
-  avatarImage: {
-    width: '100%',
-    height: '100%',
-    position: 'absolute',
-  },
+  avatarImage: { width: '100%', height: '100%', position: 'absolute' },
   avatarInitialRing: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: 'rgba(217,74,140,0.18)',
     alignItems: 'center',
     justifyContent: 'center',
   },
-  avatarInitialText: {
-    color: '#FDFBF7',
-    fontSize: 26,
-    fontWeight: '900',
-    opacity: 0.6,
-  },
-
-  // Profile info
+  avatarInitialText: { color: '#FDFBF7', fontSize: 26, fontWeight: '900', opacity: 0.6 },
   profileInfo: { flex: 1, minWidth: 0 },
   proposerName: { color: '#FDFBF7', fontSize: 19, fontWeight: '900' },
   proposerLocation: { color: '#7A7085', fontSize: 12, marginTop: 4 },
   proposerBio: { color: '#C8C0CE', fontSize: 13, lineHeight: 18, marginTop: 6 },
-
-  // Score pill
   scorePill: {
     borderWidth: 1,
     borderRadius: 14,
@@ -745,15 +764,11 @@ const styles = StyleSheet.create({
   },
   scoreValue: { fontSize: 15, fontWeight: '900' },
   scoreLabel: { color: '#A299A8', fontSize: 10, marginTop: 1 },
-
-  // Divider
   divider: {
     height: 1,
     backgroundColor: 'rgba(255,255,255,0.05)',
     marginVertical: 14,
   },
-
-  // Intent box
   intentBox: {
     borderRadius: 16,
     borderWidth: 1,
@@ -768,12 +783,7 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     marginBottom: 7,
   },
-  intentKicker: {
-    color: '#D94A8C',
-    fontSize: 10,
-    fontWeight: '900',
-    letterSpacing: 2,
-  },
+  intentKicker: { color: '#D94A8C', fontSize: 10, fontWeight: '900', letterSpacing: 2 },
   intentBadge: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -785,26 +795,16 @@ const styles = StyleSheet.create({
     paddingVertical: 3,
     backgroundColor: 'rgba(217,74,140,0.08)',
   },
-  intentDot: {
-    width: 5,
-    height: 5,
-    borderRadius: 3,
-    backgroundColor: '#D94A8C',
-  },
+  intentDot: { width: 5, height: 5, borderRadius: 3, backgroundColor: '#D94A8C' },
   intentBadgeText: { color: '#f9a8d4', fontSize: 10, fontWeight: '700' },
   intentText: { color: '#C8C0CE', fontSize: 13, lineHeight: 18 },
-
-  // Ref text
   refText: {
     color: '#4A4356',
     fontSize: 11,
     marginBottom: 14,
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
   },
-
-  // Actions
   actions: { gap: 9 },
-
   rejectButton: {
     height: 44,
     borderRadius: 14,
@@ -815,7 +815,16 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   rejectText: { color: '#fca5a5', fontSize: 14, fontWeight: '800' },
-
+  blockButton: {
+    height: 44,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(248,113,113,0.58)',
+    backgroundColor: 'rgba(127,29,29,0.18)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  blockText: { color: '#fecaca', fontSize: 14, fontWeight: '900' },
   talkButton: {
     height: 44,
     borderRadius: 14,
@@ -826,7 +835,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   talkText: { color: '#D8D0DD', fontSize: 14, fontWeight: '800' },
-
   acceptButtonWrap: {
     height: 50,
     borderRadius: 16,

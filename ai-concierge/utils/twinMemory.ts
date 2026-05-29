@@ -1,4 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { uploadJsonToWalrus } from '@/utils/walrusService';
 
 export type TwinMemoryFact = {
   id: string;
@@ -9,6 +10,19 @@ export type TwinMemoryFact = {
   confidence: number;
   createdAt: string;
   metadata?: Record<string, string | number>;
+};
+
+export type TwinTrainingFeedback = {
+  id?: string;
+  type: 'match_ended' | 'ai_chat' | 'report_accuracy' | 'safety_report' | 'block';
+  signal: string;
+  targetTwinId?: string | null;
+  targetOwner?: string | null;
+  targetName?: string | null;
+  matchId?: string | null;
+  score?: number | null;
+  note?: string;
+  createdAt?: string;
 };
 
 export type ScoutCapsule = {
@@ -26,6 +40,7 @@ export type ScoutCapsule = {
   mustHave?: string;
   dealBreaker?: string;
   voiceSample?: string;
+  feedbackHistory?: TwinTrainingFeedback[];
   updatedAt: string;
 };
 
@@ -149,31 +164,10 @@ export const buildProfileMemoryFacts = (input: {
 }): TwinMemoryFact[] =>
   [
     fact('profile:bio', 'voice', `Bio: ${input.bio}`, 'profile', 'scout', 'bio'),
-    fact(
-      'profile:looking-for',
-      'dating',
-      `Looking for: ${input.lookingFor}`,
-      'profile',
-      'scout',
-      'datingIntent',
-    ),
-    fact(
-      'profile:communication',
-      'conversation',
-      `Communication style: ${input.communicationStyle}`,
-      'profile',
-      'scout',
-      'communicationStyle',
-    ),
+    fact('profile:looking-for', 'dating', `Looking for: ${input.lookingFor}`, 'profile', 'scout', 'datingIntent'),
+    fact('profile:communication', 'conversation', `Communication style: ${input.communicationStyle}`, 'profile', 'scout', 'communicationStyle'),
     fact('profile:must-have', 'values', `Must-have: ${input.mustHave}`, 'profile', 'scout', 'mustHave'),
-    fact(
-      'profile:deal-breaker',
-      'boundaries',
-      `Dealbreaker: ${input.dealBreaker}`,
-      'profile',
-      'scout',
-      'dealBreaker',
-    ),
+    fact('profile:deal-breaker', 'boundaries', `Dealbreaker: ${input.dealBreaker}`, 'profile', 'scout', 'dealBreaker'),
   ].filter((item) => afterColon(item.text).length > 0);
 
 export const buildScoutCapsule = (facts: TwinMemoryFact[]): ScoutCapsule => {
@@ -200,6 +194,20 @@ export const buildScoutCapsule = (facts: TwinMemoryFact[]): ScoutCapsule => {
   };
 };
 
+export const buildFeedbackPromptAddendum = (capsule?: ScoutCapsule | null) => {
+  const history = capsule?.feedbackHistory ?? [];
+  if (history.length === 0) return '';
+
+  const lines = history.slice(-12).map((item) => {
+    const who = item.targetName ? ` with ${item.targetName}` : '';
+    const score = item.score ? ` at ${item.score}%` : '';
+    const note = item.note ? ` (${item.note.slice(0, 90)})` : '';
+    return `- ${item.type}${who}: ${item.signal}${score}${note}`;
+  });
+
+  return ['Training feedback history:', ...lines].join('\n');
+};
+
 export const formatScoutCapsuleForPrompt = (capsule?: ScoutCapsule | null) => {
   if (!capsule) return 'No public-safe Scout Capsule is available yet.';
 
@@ -216,6 +224,7 @@ export const formatScoutCapsuleForPrompt = (capsule?: ScoutCapsule | null) => {
     capsule.boundaries.length ? `Boundaries: ${capsule.boundaries.join(' | ')}` : '',
     capsule.communicationStyle ? `Communication style: ${capsule.communicationStyle}` : '',
     capsule.voiceSample ? `Voice sample: ${capsule.voiceSample.slice(0, 360)}` : '',
+    buildFeedbackPromptAddendum(capsule),
   ]
     .filter(Boolean)
     .join('\n');
@@ -243,4 +252,154 @@ export const rememberChatSignal = async (message: string, peerId: string) => {
       0.45,
     ),
   ]);
+};
+
+export const appendFeedbackToScoutCapsule = async (feedback: TwinTrainingFeedback) => {
+  const feedbackId = feedback.id ?? `feedback:${feedback.type}:${Date.now()}`;
+  const createdAt = feedback.createdAt ?? new Date().toISOString();
+
+  const savedFeedback: TwinTrainingFeedback & { id: string; createdAt: string } = {
+    ...feedback,
+    id: feedbackId,
+    createdAt,
+  };
+
+  const current = await loadLocalScoutCapsule();
+
+  const nextCapsule: ScoutCapsule = {
+    version: 1,
+    kind: 'chaptr-scout-capsule',
+    traits: current?.traits ?? [],
+    datingIntent: current?.datingIntent,
+    datingPace: current?.datingPace,
+    conversationChemistry: current?.conversationChemistry ?? [],
+    idealDateEnergy: current?.idealDateEnergy,
+    values: current?.values ?? [],
+    careStyle: current?.careStyle,
+    boundaries: current?.boundaries ?? [],
+    communicationStyle: current?.communicationStyle,
+    mustHave: current?.mustHave,
+    dealBreaker: current?.dealBreaker,
+    voiceSample: current?.voiceSample,
+    feedbackHistory: [...(current?.feedbackHistory ?? []), savedFeedback].slice(-40),
+    updatedAt: new Date().toISOString(),
+  };
+
+  await saveLocalScoutCapsule(nextCapsule);
+
+  await upsertTwinMemoryFacts([
+    fact(
+      feedbackId,
+      savedFeedback.type === 'block' || savedFeedback.type === 'safety_report'
+        ? 'boundaries'
+        : 'dating',
+      `Feedback: ${savedFeedback.type} ${savedFeedback.signal}`,
+      'feedback',
+      'scout',
+      'trainingFeedback',
+      0.9,
+    ),
+  ]);
+
+  return savedFeedback;
+};
+export type PublishedScoutCapsule = Omit<ScoutCapsule, 'feedbackHistory'> & {
+  trainingSummary?: string[];
+  publishedAt: string;
+};
+
+const summarizeFeedbackForScoutCapsule = (
+  feedbackHistory: TwinTrainingFeedback[] = [],
+): string[] => {
+  const summary = new Set<string>();
+
+  feedbackHistory.slice(-30).forEach((item) => {
+    if (item.type === 'ai_chat') {
+      if (item.signal === 'good_fit') {
+        summary.add('Explore more matches with similar conversation chemistry.');
+      }
+
+      if (item.signal === 'not_for_me') {
+        summary.add('Avoid over-weighting surface-level chat compatibility.');
+      }
+    }
+
+    if (item.type === 'report_accuracy') {
+      if (item.signal === 'accurate') {
+        summary.add('Keep trusting similar scout-report signals.');
+      }
+
+      if (item.signal === 'somewhat' || item.signal === 'somewhat_accurate') {
+        summary.add('Treat scout-report scores as directional, not final.');
+      }
+
+      if (item.signal === 'not_accurate') {
+        summary.add('Be more cautious when predicting compatibility from limited profile data.');
+      }
+    }
+
+    if (item.type === 'match_ended') {
+      if (item.signal === 'different_intentions') {
+        summary.add('Screen dating intentions more carefully before recommending a match.');
+      }
+
+      if (item.signal === 'communication_style') {
+        summary.add('Pay closer attention to communication style compatibility.');
+      }
+
+      if (item.signal === 'no_real_spark') {
+        summary.add('Look for stronger emotional spark, not only shared values.');
+      }
+
+      if (item.signal === 'finished_naturally') {
+        summary.add('Treat natural closure as neutral feedback, not a failure signal.');
+      }
+    }
+
+    if (item.type === 'block' || item.type === 'safety_report') {
+      summary.add('Prioritize safety, boundaries, and user comfort over match score.');
+    }
+  });
+
+  return Array.from(summary).slice(0, 10);
+};
+
+export const buildPublicSafeScoutCapsule = (
+  capsule: ScoutCapsule,
+): PublishedScoutCapsule => ({
+  version: 1,
+  kind: 'chaptr-scout-capsule',
+  traits: capsule.traits,
+  datingIntent: capsule.datingIntent,
+  datingPace: capsule.datingPace,
+  conversationChemistry: capsule.conversationChemistry,
+  idealDateEnergy: capsule.idealDateEnergy,
+  values: capsule.values,
+  careStyle: capsule.careStyle,
+  boundaries: capsule.boundaries,
+  communicationStyle: capsule.communicationStyle,
+  mustHave: capsule.mustHave,
+  dealBreaker: capsule.dealBreaker,
+  voiceSample: capsule.voiceSample,
+  trainingSummary: summarizeFeedbackForScoutCapsule(capsule.feedbackHistory),
+  updatedAt: new Date().toISOString(),
+  publishedAt: new Date().toISOString(),
+});
+
+export const publishPublicSafeScoutCapsule = async () => {
+  const capsule = await loadLocalScoutCapsule();
+
+  if (!capsule) {
+    throw new Error('No local Scout Capsule found.');
+  }
+
+  const publicCapsule = buildPublicSafeScoutCapsule(capsule);
+  const blobId = await uploadJsonToWalrus(publicCapsule);
+
+  await AsyncStorage.setItem('chaptr:my-updated-scout-ref', blobId);
+
+  return {
+    blobId,
+    capsule: publicCapsule,
+  };
 };
