@@ -208,7 +208,7 @@ export default function ProfileSetupScreen() {
 
     setStatusMsg('Opening Google sign-in...');
 
-    const { nonce } = await setupZkLoginParams();
+    const params = await setupZkLoginParams();
     const redirectUri = AuthSession.makeRedirectUri();
 
     const request = new AuthSession.AuthRequest({
@@ -216,19 +216,52 @@ export default function ProfileSetupScreen() {
       responseType: AuthSession.ResponseType.IdToken,
       scopes: ['openid', 'email', 'profile'],
       redirectUri,
-      extraParams: { nonce, prompt: 'select_account' },
+      extraParams: { nonce: params.nonce, prompt: 'select_account' },
       usePKCE: false,
     });
 
     const result = await request.promptAsync(discovery);
-
     if (result.type !== 'success') throw new Error('Google sign-in was cancelled or failed');
 
     const idToken = result.params.id_token;
-
     if (!idToken) throw new Error('No id_token in Google response');
 
     return idToken;
+  };
+
+  const autoFundIfNeeded = async (userAddress: string): Promise<void> => {
+    try {
+      const coins = await suiClient.getCoins({ owner: userAddress, coinType: '0x2::sui::SUI' });
+      const totalBalance = coins.data.reduce(
+        (sum: number, coin: any) => sum + Number(coin.balance), 0
+      );
+
+      if (totalBalance > 50_000_000) {
+        console.log('Already funded:', totalBalance);
+        return;
+      }
+
+      setStatusMsg('Requesting testnet SUI for gas...');
+
+      const faucetRes = await fetch('https://faucet.testnet.sui.io/v1/gas', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          FixedAmountRequest: { recipient: userAddress },
+        }),
+      });
+
+      if (!faucetRes.ok) {
+        const text = await faucetRes.text();
+        console.warn('Faucet request failed (continuing anyway):', text);
+        return;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      console.log('Faucet funded:', userAddress);
+    } catch (err) {
+      console.warn('Auto-fund failed (continuing):', err);
+    }
   };
 
   const handleMint = async (jwt: string) => {
@@ -247,6 +280,7 @@ export default function ProfileSetupScreen() {
     );
 
     console.log('Fund this zkLogin testnet address:', userAddress);
+    await autoFundIfNeeded(userAddress);
 
     let photoBlobIds: string[] = [];
 
@@ -267,7 +301,7 @@ export default function ProfileSetupScreen() {
       mustHave: mustHave.trim(),
       dealBreaker: dealBreaker.trim(),
     });
-    
+
     const allMemoryFacts = await upsertTwinMemoryFacts(profileFacts);
     const scoutCapsule = buildScoutCapsule(allMemoryFacts);
     await saveLocalScoutCapsule(scoutCapsule);
@@ -363,7 +397,8 @@ export default function ProfileSetupScreen() {
       signature: zkSignature,
       options: { showEffects: true, showObjectChanges: true },
     });
-    const objectChanges=(result as any).objectChanges;
+
+    const objectChanges = (result as any).objectChanges;
     const twinObjectId = extractCreatedTwinId(objectChanges);
 
     console.log('TX Digest:', result.digest);
@@ -388,6 +423,78 @@ export default function ProfileSetupScreen() {
 
     setStatusMsg('Digital Twin joined the Twin Pool');
     setTimeout(() => router.replace('/(tabs)'), 1200);
+  };
+
+  // ── Re-register existing twin ──────────────────────────────────────────────
+  // Used when the Walrus scout blob has expired but the on-chain twin is intact.
+  // Calls register_existing_agent with the current scout ref (already re-uploaded).
+  const handleReRegister = async () => {
+    try {
+      setIsMinting(true);
+
+      const existingTwinId = await AsyncStorage.getItem('chaptr:my-twin-id');
+      const existingOwner = await AsyncStorage.getItem('chaptr:my-owner');
+      const existingScoutRef = await AsyncStorage.getItem('chaptr:my-scout-ref');
+
+      if (!existingTwinId || !existingOwner || !existingScoutRef) {
+        throw new Error('Missing local twin data. Cannot re-register.');
+      }
+
+      setStatusMsg('Opening Google sign-in...');
+      const jwt = await getJwtForMint();
+
+      setStatusMsg('Generating ZK proof...');
+      const { ephemeralKeyPair, maxEpoch, randomness } = await loadZkLoginParams();
+      const { zkProof, addressSeed, userAddress } = await fetchZkProof(
+        jwt,
+        ephemeralKeyPair,
+        maxEpoch,
+        randomness,
+      );
+
+      if (userAddress.toLowerCase() !== existingOwner.toLowerCase()) {
+        throw new Error('Google account does not match this browser identity.');
+      }
+
+      setStatusMsg('Re-registering twin in pool...');
+
+      const tx = new Transaction();
+      tx.setSender(userAddress);
+      tx.moveCall({
+        target: `${PACKAGE_ID}::agent::register_existing_agent`,
+        arguments: [
+          tx.object(TWIN_POOL_ID),
+          tx.object(existingTwinId),
+          tx.pure.string(existingScoutRef),
+        ],
+      });
+
+      const { bytes, signature: userSignature } = await tx.sign({
+        client: suiClient,
+        signer: ephemeralKeyPair,
+      });
+
+      const zkSignature = getZkLoginSignature({
+        inputs: { ...(zkProof as any), addressSeed },
+        maxEpoch,
+        userSignature,
+      });
+
+      const result = await suiClient.executeTransactionBlock({
+        transactionBlock: bytes,
+        signature: zkSignature,
+        options: { showEffects: true },
+      });
+
+      console.log('Re-register digest:', result.digest);
+      setStatusMsg('Twin re-registered in pool ✅');
+      setTimeout(() => router.replace('/(tabs)'), 1200);
+    } catch (e: any) {
+      console.error('Re-register failed:', e);
+      setStatusMsg(`Re-register failed: ${e.message}`);
+    } finally {
+      setIsMinting(false);
+    }
   };
 
   const handleComplete = async () => {
@@ -422,6 +529,43 @@ export default function ProfileSetupScreen() {
                 Vector stored: {vectorBlobId.slice(0, 10)}...
               </Text>
             )}
+          </View>
+
+          {/* ── Re-register banner — shown when twin already exists ── */}
+          <View style={styles.reRegisterBanner}>
+            <Text style={styles.reRegisterTitle}>Already have a Twin?</Text>
+            <Text style={styles.reRegisterBody}>
+              If your scout profile expired or went missing from the pool, re-register your
+              existing Twin without creating a new one.
+            </Text>
+            <TouchableOpacity
+              onPress={handleReRegister}
+              disabled={isMinting}
+              style={styles.reRegisterButtonWrap}
+              activeOpacity={0.85}
+            >
+              <LinearGradient
+                colors={isMinting ? ['#1a2a1a', '#1a2a1a'] : ['#4ade80', '#22c55e']}
+                start={{ x: 0, y: 0 }}
+                end={{ x: 1, y: 1 }}
+                style={styles.reRegisterButton}
+              >
+                {isMinting ? (
+                  <View style={styles.loadingRow}>
+                    <ActivityIndicator color="#fff" size="small" />
+                    <Text style={styles.reRegisterButtonText}>{statusMsg || 'Processing...'}</Text>
+                  </View>
+                ) : (
+                  <Text style={styles.reRegisterButtonText}>Re-register Existing Twin</Text>
+                )}
+              </LinearGradient>
+            </TouchableOpacity>
+          </View>
+
+          <View style={styles.divider}>
+            <View style={styles.dividerLine} />
+            <Text style={styles.dividerLabel}>or create a new Twin</Text>
+            <View style={styles.dividerLine} />
           </View>
 
           <Text style={styles.sectionLabel}>Your Photos</Text>
@@ -629,6 +773,64 @@ const styles = StyleSheet.create({
   },
   subtitle: { fontSize: 15, color: '#A299A8', lineHeight: 22 },
   blobConfirm: { marginTop: 10, fontSize: 12, color: '#4ade80', fontFamily: 'monospace' },
+
+  // ── Re-register banner ──
+  reRegisterBanner: {
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: 'rgba(74,222,128,0.28)',
+    backgroundColor: 'rgba(74,222,128,0.06)',
+    padding: 16,
+    marginBottom: 8,
+  },
+  reRegisterTitle: {
+    color: '#4ade80',
+    fontSize: 13,
+    fontWeight: '800',
+    letterSpacing: 0.5,
+    marginBottom: 6,
+  },
+  reRegisterBody: {
+    color: '#8DA89A',
+    fontSize: 13,
+    lineHeight: 18,
+    marginBottom: 14,
+  },
+  reRegisterButtonWrap: {
+    height: 46,
+    borderRadius: 14,
+    overflow: 'hidden',
+  },
+  reRegisterButton: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  reRegisterButtonText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '800',
+  },
+
+  // ── Divider ──
+  divider: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginTop: 20,
+    marginBottom: 8,
+  },
+  dividerLine: {
+    flex: 1,
+    height: 1,
+    backgroundColor: '#2A2432',
+  },
+  dividerLabel: {
+    color: '#4A4356',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+
   sectionLabel: {
     color: '#D94A8C',
     fontSize: 13,
