@@ -877,7 +877,7 @@ export default function MorningBriefingScreen() {
   const loadPoolProfiles = useCallback(async () => {
     setIsLoading(true);
     setError(null);
-
+  
     try {
       const [
         entries,
@@ -898,22 +898,56 @@ export default function MorningBriefingScreen() {
         readBlockedProfileKeys(),
         readHiddenProfileIds(),
       ]);
-
+  
       const blockedKeySet = new Set(blockedKeys.map((key) => key.toLowerCase()));
       const hiddenProfileIdSet = new Set(hiddenProfileIds.map((id) => id.toLowerCase()));
-
+  
+      // ── Build set of owners currently in an active human match ──
+      // These profiles should be invisible in the pool while matched.
+      // syncHumanMatchesFromSui is the source of truth — it cross-checks
+      // MatchFormed vs MatchEnded events on chain, so this is always fresh.
+      const chainMatches = myOwner
+        ? await syncHumanMatchesFromSui(myOwner).catch(() => [])
+        : [];
+  
+      // Also read local matches as fallback (covers indexing delay)
+      const localMatchesRaw = await AsyncStorage.getItem(HUMAN_MATCHES_KEY);
+      const localMatches: HumanMatch[] = (() => {
+        try {
+          const parsed = JSON.parse(localMatchesRaw ?? '[]');
+          return Array.isArray(parsed) ? parsed : [];
+        } catch {
+          return [];
+        }
+      })();
+  
+      // Union of chain + local — use whichever has more data
+      const allKnownMatches = chainMatches.length > 0 ? chainMatches : localMatches;
+  
+      // Owners who are currently matched (their twins should not appear in pool)
+      const activeMatchedOwners = new Set(
+        allKnownMatches.map((m) => m.participantOwner.toLowerCase()),
+      );
+  
+      // Also hide yourself from the pool if YOU are in an active match
+      // (your twin should appear "busy" to others — handled on their side,
+      // but this prevents edge-case self-visibility issues)
+      const iAmMatched = allKnownMatches.length > 0;
+  
       if (entries.length === 0) {
         setProfiles([]);
         return;
       }
-
+  
       const myPoolEntry = myOwner
         ? entries.find((entry) => sameAddress(entry.owner, myOwner))
         : null;
-
+  
       const myScoutRef = storedMyScoutRef || myPoolEntry?.scout_ref || null;
-      const fetchedMyScout = myScoutRef ? await fetchScoutProfile(myScoutRef).catch(() => null) : null;
-
+      const fetchedMyScout = myScoutRef
+        ? await fetchScoutProfile(myScoutRef).catch(() => null)
+        : null;
+  
       const myScout = fetchedMyScout
         ? {
             ...fetchedMyScout,
@@ -925,38 +959,46 @@ export default function MorningBriefingScreen() {
             } as ScoutCapsule,
           }
         : null;
-
+  
       const settled = await Promise.allSettled(
         entries.map(async (entry) => {
+          // Skip self
           if (myOwner && sameAddress(entry.owner, myOwner)) return null;
-
+  
           const entryKeys = [entry.owner, entry.twin_id].map((value) => value.toLowerCase());
-
+  
+          // Skip blocked or hidden profiles
           if (
             entryKeys.some((key) => blockedKeySet.has(key)) ||
             hiddenProfileIdSet.has(entry.twin_id.toLowerCase())
           ) {
             return null;
           }
-
+  
+          // ── Skip profiles whose owner is currently in an active human match ──
+          // They are "off the market" until their match ends on-chain.
+          if (activeMatchedOwners.has(entry.owner.toLowerCase())) {
+            return null;
+          }
+  
           const scout = await fetchScoutProfile(entry.scout_ref);
-
+  
           const theyWantMe = matchesInterest(scout.interestedIn, myGender);
           const iWantThem = matchesInterest(myInterestedIn, scout.gender);
-
+  
           if (!theyWantMe || !iWantThem) return null;
-
+  
           const baseProfile = entryToProfile(entry, scout);
-
+  
           if (!myScout) return baseProfile;
-
+  
           const { report, reportRef } = await loadOrCreateScoutReport(
             entry.twin_id,
             entry.scout_ref,
             myScout,
             scout,
           );
-
+  
           return {
             ...baseProfile,
             compatibility: report.score,
@@ -965,13 +1007,13 @@ export default function MorningBriefingScreen() {
           };
         }),
       );
-
+  
       const resolved = settled
         .filter((r): r is PromiseFulfilledResult<Profile | null> => r.status === 'fulfilled')
         .map((r) => r.value)
         .filter((p): p is Profile => p !== null)
         .sort((a, b) => b.compatibility - a.compatibility);
-
+  
       setProfiles(resolved);
     } catch (err: any) {
       console.error('Failed to load pool profiles:', err);
