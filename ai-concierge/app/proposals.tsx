@@ -16,7 +16,7 @@ import { LinearGradient } from 'expo-linear-gradient';
 import { router, useFocusEffect } from 'expo-router';
 import * as WebBrowser from 'expo-web-browser';
 import * as AuthSession from 'expo-auth-session';
-import { getZkLoginSignature } from '@mysten/sui/zklogin';
+import { getZkLoginSignature,generateNonce  } from '@mysten/sui/zklogin';
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
 import { readBlockedProfileKeys, writeBlockEntry } from '@/utils/safetyService';
 import {
@@ -190,7 +190,22 @@ const queryProposalEvents = async () => {
 };
 
 const getJwtForProposalAction = async () => {
-  const { nonce } = await setupZkLoginParams();
+  // Load existing zk params — DO NOT call setupZkLoginParams() here
+  // setupZkLoginParams clears keys first, breaking the ephemeral key match
+  let params;
+  try {
+    params = await loadZkLoginParams();
+  } catch {
+    // Only setup fresh if truly missing
+    params = await setupZkLoginParams();
+  }
+
+  const nonce  = generateNonce(
+    params.ephemeralKeyPair.getPublicKey(),
+    params.maxEpoch,
+    params.randomness,
+  );
+
   const redirectUri = AuthSession.makeRedirectUri();
 
   const request = new AuthSession.AuthRequest({
@@ -271,13 +286,21 @@ export default function ProposalsScreen() {
         return;
       }
 
-      const [eventsResult, poolEntries, hiddenProposalIds, blockedProfileKeys] =
-        await Promise.all([
-          queryProposalEvents(),
-          fetchPoolEntries(),
-          readStringArray(HIDDEN_PROPOSALS_KEY),
-          readBlockedProfileKeys(),
-        ]);
+      const [eventsResult, poolEntries, hiddenProposalIds, blockedProfileKeys, existingMatchesRaw] =
+  await Promise.all([
+    queryProposalEvents(),
+    fetchPoolEntries(),
+    readStringArray(HIDDEN_PROPOSALS_KEY),
+    readBlockedProfileKeys(),
+    AsyncStorage.getItem(HUMAN_MATCHES_KEY),
+  ]);
+
+const existingMatches = existingMatchesRaw ? JSON.parse(existingMatchesRaw) : [];
+const alreadyMatchedOwners = new Set(
+  (Array.isArray(existingMatches) ? existingMatches : [])
+    .map((m: any) => (m.participantOwner ?? '').toLowerCase())
+    .filter(Boolean)
+);
 
       const blockedKeySet = new Set(blockedProfileKeys.map((key) => key.toLowerCase()));
 
@@ -298,7 +321,9 @@ export default function ProposalsScreen() {
         .filter((event) => event.proposalId)
         .filter((event) => sameAddress(event.to, myOwner))
         .filter((event) => !hiddenProposalIds.includes(event.proposalId))
-        .filter((event) => !blockedKeySet.has(event.from.toLowerCase()));
+        .filter((event) => !blockedKeySet.has(event.from.toLowerCase()))
+        .filter((event) => !alreadyMatchedOwners.has(event.from.toLowerCase()))
+        .filter((event) => !sameAddress(event.from, myOwner)); // never show your own proposals back
 
       const uniqueByProposal = new Map<string, typeof incomingEvents[number]>();
       incomingEvents.forEach((event) => uniqueByProposal.set(event.proposalId, event));
