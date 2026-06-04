@@ -17,7 +17,7 @@ import { LinearGradient } from 'expo-linear-gradient';
 import { router, useLocalSearchParams } from 'expo-router';
 import * as WebBrowser from 'expo-web-browser';
 import * as AuthSession from 'expo-auth-session';
-import { getZkLoginSignature } from '@mysten/sui/zklogin';
+import { getZkLoginSignature, generateNonce } from '@mysten/sui/zklogin';
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
 import { buildSendHumanMessageTx } from '@/utils/suiTransactions';
 import { fetchJsonFromWalrus, uploadJsonToWalrus } from '@/utils/walrusService';
@@ -115,7 +115,17 @@ const getJwtForChatAction = async () => {
     throw new Error('Missing EXPO_PUBLIC_GOOGLE_CLIENT_ID');
   }
 
-  const { nonce } = await setupZkLoginParams();
+  let params;
+try {
+  params = await loadZkLoginParams();
+} catch {
+  params = await setupZkLoginParams();
+}
+const nonce = generateNonce(
+  params.ephemeralKeyPair.getPublicKey(),
+  params.maxEpoch,
+  params.randomness,
+);
 
   const request = new AuthSession.AuthRequest({
     clientId: GOOGLE_CLIENT_ID,
