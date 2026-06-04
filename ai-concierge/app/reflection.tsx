@@ -13,7 +13,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import * as WebBrowser from 'expo-web-browser';
 import * as AuthSession from 'expo-auth-session';
-import { getZkLoginSignature } from '@mysten/sui/zklogin';
+import { getZkLoginSignature, generateNonce } from '@mysten/sui/zklogin';
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
 import { buildEndMatchTx } from '@/utils/suiTransactions';
 import { writeFeedback, submitReport, writeBlockEntry } from '@/utils/safetyService';
@@ -71,10 +71,24 @@ const ACCURACY_OPTIONS = [
   { key: 'not_accurate', label: 'No, the report missed the mark' },
 ];
 
+// Gets JWT immediately on user gesture — must be called before any awaits
 const getJwtForEndMatch = async () => {
   if (!GOOGLE_CLIENT_ID) throw new Error('Missing EXPO_PUBLIC_GOOGLE_CLIENT_ID');
 
-  const { nonce } = await setupZkLoginParams();
+  // Reuse existing zk params — do NOT call setupZkLoginParams() which clears keys
+  let params;
+  try {
+    params = await loadZkLoginParams();
+  } catch {
+    params = await setupZkLoginParams();
+  }
+
+  const nonce = generateNonce(
+    params.ephemeralKeyPair.getPublicKey(),
+    params.maxEpoch,
+    params.randomness,
+  );
+
   const redirectUri = AuthSession.makeRedirectUri();
 
   const request = new AuthSession.AuthRequest({
@@ -95,8 +109,8 @@ const getJwtForEndMatch = async () => {
   return idToken;
 };
 
-const executeEndMatch = async (matchId: string, expectedOwner: string) => {
-  const jwt = await getJwtForEndMatch();
+// Accepts jwt as parameter — called after local writes so popup isn't blocked
+const executeEndMatch = async (matchId: string, expectedOwner: string, jwt: string) => {
   const { ephemeralKeyPair, maxEpoch, randomness } = await loadZkLoginParams();
   const { zkProof, addressSeed, userAddress } = await fetchZkProof(
     jwt,
@@ -146,6 +160,13 @@ const cleanupEndedMatch = async (input: {
   const raw = await AsyncStorage.getItem(HUMAN_MATCHES_KEY);
   const parsed = raw ? JSON.parse(raw) : [];
   const matches = Array.isArray(parsed) ? parsed : [];
+  // Remove participant's twin ID from unlocked profiles on match end
+const unlockedRaw = await AsyncStorage.getItem('chaptr:unlocked-profiles');
+const unlocked = unlockedRaw ? JSON.parse(unlockedRaw) : [];
+const filtered = unlocked.filter((id: string) => 
+  id.toLowerCase() !== input.targetTwinId.toLowerCase()
+);
+await AsyncStorage.setItem('chaptr:unlocked-profiles', JSON.stringify(filtered));
 
   const next = matches.filter((match) => {
     const matchKeys = [
@@ -197,13 +218,21 @@ export default function ReflectionScreen() {
 
   async function handleSubmit() {
     if (submitting) return;
-
     setSubmitting(true);
 
     try {
       const reporterOwner = await AsyncStorage.getItem('chaptr:my-owner');
       if (isHumanReflection && !reporterOwner) throw new Error('Missing local Chaptr identity.');
 
+      // ── Get JWT FIRST before any other async work ──
+      // Must be close to the user gesture so the browser allows the popup.
+      // If we await other things first, the browser blocks the popup window.
+      let jwt: string | null = null;
+      if (isHumanReflection && matchId && reporterOwner) {
+        jwt = await getJwtForEndMatch();
+      }
+
+      // ── Now do all local writes ──
       const metaNote = [`source:${source}`, proposalId ? `proposal:${proposalId}` : '']
         .filter(Boolean)
         .join(' ');
@@ -259,8 +288,9 @@ export default function ReflectionScreen() {
         });
       }
 
-      if (isHumanReflection && matchId && reporterOwner) {
-        await executeEndMatch(matchId, reporterOwner);
+      // ── Fire on-chain tx using the JWT we got upfront ──
+      if (isHumanReflection && matchId && reporterOwner && jwt) {
+        await executeEndMatch(matchId, reporterOwner, jwt);
         await cleanupEndedMatch({ matchId, proposalId, targetOwner, targetTwinId });
       }
 
@@ -348,7 +378,11 @@ export default function ReflectionScreen() {
           disabled={submitting}
           activeOpacity={0.8}
         >
-          {submitting ? <ActivityIndicator color="#fff" /> : <Text style={s.submitLabel}>Submit & Close</Text>}
+          {submitting ? (
+            <ActivityIndicator color="#fff" />
+          ) : (
+            <Text style={s.submitLabel}>Submit & Close</Text>
+          )}
         </TouchableOpacity>
 
         <TouchableOpacity onPress={() => router.replace('/(tabs)')} style={s.skipBtn}>
@@ -397,7 +431,13 @@ const s = StyleSheet.create({
   title: { fontSize: 22, fontWeight: '700', color: '#fff', marginBottom: 6 },
   subtitle: { fontSize: 14, color: '#888' },
   section: { marginBottom: 28 },
-  sectionLabel: { fontSize: 13, fontWeight: '600', color: '#aaa', marginBottom: 12, letterSpacing: 0.5 },
+  sectionLabel: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#aaa',
+    marginBottom: 12,
+    letterSpacing: 0.5,
+  },
   chipRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
   chip: {
     paddingHorizontal: 14,
