@@ -20,6 +20,37 @@ import {
   type TwinMemoryFact,
   type TwinTrainingFeedback,
 } from '@/utils/twinMemory';
+import { TextInput } from 'react-native';
+import { Transaction } from '@mysten/sui/transactions';
+import { getZkLoginSignature } from '@mysten/sui/zklogin';
+import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
+import * as AuthSession from 'expo-auth-session';
+import * as WebBrowser from 'expo-web-browser';
+import { fetchZkProof, loadZkLoginParams, setupZkLoginParams } from '@/utils/zkLoginService';
+import { buildCreateMandateTx, buildUpdateMandateTx } from '@/utils/suiTransactions';
+
+WebBrowser.maybeCompleteAuthSession();
+
+const GOOGLE_CLIENT_ID = process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID || '';
+const suiClient = new SuiJsonRpcClient({ url: getJsonRpcFullnodeUrl('testnet'), network: 'testnet' });
+const discovery = { authorizationEndpoint: 'https://accounts.google.com/o/oauth2/v2/auth' };
+
+const getJwtForTransaction = async (): Promise<string> => {
+  const { nonce } = await setupZkLoginParams();
+  const redirectUri = AuthSession.makeRedirectUri();
+  const request = new AuthSession.AuthRequest({
+    clientId: GOOGLE_CLIENT_ID,
+    responseType: AuthSession.ResponseType.IdToken,
+    scopes: ['openid', 'email', 'profile'],
+    redirectUri,
+    extraParams: { nonce, prompt: 'select_account' },
+    usePKCE: false,
+  });
+  const result = await request.promptAsync(discovery);
+  if (result.type !== 'success') throw new Error('Google sign-in was cancelled');
+  if (!result.params.id_token) throw new Error('No id_token');
+  return result.params.id_token;
+};
 
 const UPDATED_SCOUT_REF_KEY = 'chaptr:my-updated-scout-ref';
 
@@ -66,15 +97,25 @@ export default function TwinTrainingScreen() {
     setIsLoading(true);
 
     try {
-      const [savedCapsule, savedFacts, savedPublishedRef] = await Promise.all([
+      const [savedCapsule, savedFacts, savedPublishedRef, savedMandateId, savedMandateSettings] = await Promise.all([
         loadLocalScoutCapsule(),
         loadTwinMemoryFacts(),
         AsyncStorage.getItem(UPDATED_SCOUT_REF_KEY),
+        AsyncStorage.getItem('chaptr:mandate-id'),
+        AsyncStorage.getItem('chaptr:mandate-settings'),
       ]);
-
+      
       setCapsule(savedCapsule);
       setFacts(savedFacts);
       setPublishedRef(savedPublishedRef);
+      setMandateId(savedMandateId);
+      if(savedMandateSettings) {
+        const s = JSON.parse(savedMandateSettings);
+    setMayScout(s.mayScout ?? true);
+    setMayRunA2A(s.mayRunA2A ?? false);
+    setMayPropose(s.mayPropose ?? false);
+    setMinScore(String(s.minScore ?? '80'));
+  }
     } catch (error) {
       console.warn('Failed to load Twin training:', error);
       setCapsule(null);
@@ -111,6 +152,92 @@ export default function TwinTrainingScreen() {
       setIsPublishing(false);
     }
   };
+  // ── Mandate / Twin Autonomy state ─────────────────────────────────────────
+const [mayScout, setMayScout] = useState(true);
+const [mayRunA2A, setMayRunA2A] = useState(false);
+const [mayPropose, setMayPropose] = useState(false);
+const [minScore, setMinScore] = useState('80');
+const [mandateId, setMandateId] = useState<string | null>(null);
+const [isActivatingMandate, setIsActivatingMandate] = useState(false);
+const [mandateStatusMsg, setMandateStatusMsg] = useState('');
+
+const MANDATE_KEY = 'chaptr:mandate-id';
+
+
+const handleActivateMandate = async () => {
+  if (isActivatingMandate) return;
+  setIsActivatingMandate(true);
+  setMandateStatusMsg('Opening Google sign-in...');
+
+  try {
+    const myOwner = await AsyncStorage.getItem('chaptr:my-owner');
+    if (!myOwner) throw new Error('No local identity found.');
+
+    const jwt = await getJwtForTransaction();
+
+    setMandateStatusMsg('Generating ZK proof...');
+    const { ephemeralKeyPair, maxEpoch, randomness } = await loadZkLoginParams();
+    const { zkProof, addressSeed, userAddress } = await fetchZkProof(
+      jwt, ephemeralKeyPair, maxEpoch, randomness,
+    );
+
+    if (userAddress.toLowerCase() !== myOwner.toLowerCase()) {
+      throw new Error('Google account does not match this browser identity.');
+    }
+
+    const scoreVal = Math.max(70, Math.min(99, Number(minScore) || 80));
+
+    setMandateStatusMsg(mandateId ? 'Updating Mandate...' : 'Activating Mandate...');
+
+    const tx = mandateId
+      ? buildUpdateMandateTx(mandateId, mayScout, mayRunA2A, mayPropose, scoreVal)
+      : buildCreateMandateTx(mayScout, mayRunA2A, mayPropose, scoreVal);
+
+    tx.setSender(userAddress);
+    const { bytes, signature: userSignature } = await tx.sign({
+      client: suiClient,
+      signer: ephemeralKeyPair,
+    });
+    const zkSignature = getZkLoginSignature({
+      inputs: { ...(zkProof as any), addressSeed },
+      maxEpoch,
+      userSignature,
+    });
+
+    const result = await suiClient.executeTransactionBlock({
+      transactionBlock: bytes,
+      signature: zkSignature,
+      options: { showEffects: true, showObjectChanges: true },
+    });
+
+    // Extract new mandate object ID if this was a create
+    if (!mandateId) {
+      const mandateObj = (result as any).objectChanges?.find(
+        (change: any) =>
+          change.type === 'created' &&
+          typeof change.objectType === 'string' &&
+          change.objectType.includes('::mandate::Mandate'),
+      );
+      if (mandateObj?.objectId) {
+        await AsyncStorage.setItem(MANDATE_KEY, mandateObj.objectId);
+        setMandateId(mandateObj.objectId);
+      }
+    }
+    await AsyncStorage.setItem('chaptr:mandate-settings', JSON.stringify({
+      mayScout,
+      mayRunA2A,
+      mayPropose,
+      minScore: Number(minScore),
+    }));
+    setMandateStatusMsg(mandateId ? 'Mandate updated ✅' : 'Mandate activated ✅');
+    setTimeout(() => setMandateStatusMsg(''), 3000);
+  } catch (err: any) {
+    console.error('Mandate activation failed:', err);
+    setMandateStatusMsg(`Failed: ${err.message}`);
+  } finally {
+    setIsActivatingMandate(false);
+  }
+};
 
   const feedbackHistory = useMemo(
     () => [...(capsule?.feedbackHistory ?? [])].reverse(),
@@ -279,6 +406,80 @@ export default function TwinTrainingScreen() {
             value={capsule?.updatedAt ? formatDate(capsule.updatedAt) : undefined}
           />
         </View>
+        {/* ── Twin Autonomy ──────────────────────────────────────────────── */}
+<View style={styles.section}>
+  <Text style={styles.sectionTitle}>Twin Autonomy</Text>
+
+  <View style={autonomyStyles.panel}>
+    <Text style={autonomyStyles.panelKicker}>MANDATE OBJECT · SUI</Text>
+    <Text style={autonomyStyles.panelTitle}>
+      What is your Twin allowed to do?
+    </Text>
+    <Text style={autonomyStyles.panelBody}>
+      A Mandate object lives in your wallet and defines your Twin's permissions. 
+      No human is involved when your Twin acts within these bounds.
+    </Text>
+
+    {mandateId ? (
+      <Text style={autonomyStyles.mandateRef}>
+        Mandate: {mandateId.slice(0, 10)}...{mandateId.slice(-6)}
+      </Text>
+    ) : null}
+
+    {/* Permission toggles */}
+    <ToggleRow
+      label="May scout profiles automatically"
+      value={mayScout}
+      onChange={setMayScout}
+    />
+    <ToggleRow
+      label="May run Agent-to-Agent conversations"
+      value={mayRunA2A}
+      onChange={setMayRunA2A}
+    />
+    <ToggleRow
+      label="May propose without my approval"
+      value={mayPropose}
+      onChange={setMayPropose}
+    />
+
+    {mayPropose && (
+      <View style={autonomyStyles.scoreRow}>
+        <Text style={autonomyStyles.scoreLabel}>
+          Min score to auto-propose
+        </Text>
+        <TextInput
+          style={autonomyStyles.scoreInput}
+          value={minScore}
+          onChangeText={setMinScore}
+          keyboardType="numeric"
+          maxLength={2}
+          placeholderTextColor="#6D6175"
+        />
+        <Text style={autonomyStyles.scoreUnit}>%</Text>
+      </View>
+    )}
+
+    {mandateStatusMsg ? (
+      <Text style={autonomyStyles.statusMsg}>{mandateStatusMsg}</Text>
+    ) : null}
+
+    <TouchableOpacity
+      style={[autonomyStyles.activateButton, isActivatingMandate && autonomyStyles.activateButtonDisabled]}
+      onPress={handleActivateMandate}
+      disabled={isActivatingMandate}
+      activeOpacity={0.85}
+    >
+      <Text style={autonomyStyles.activateButtonText}>
+        {isActivatingMandate
+          ? mandateStatusMsg || 'Processing...'
+          : mandateId
+          ? 'Update Mandate'
+          : 'Activate Mandate'}
+      </Text>
+    </TouchableOpacity>
+  </View>
+</View>
       </ScrollView>
     </SafeAreaView>
   );
@@ -311,7 +512,155 @@ function CapsuleLine({ label, value }: { label: string; value?: string }) {
     </View>
   );
 }
-
+function ToggleRow({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <TouchableOpacity
+      style={autonomyStyles.toggleRow}
+      onPress={() => onChange(!value)}
+      activeOpacity={0.8}
+    >
+      <Text style={autonomyStyles.toggleLabel}>{label}</Text>
+      <View style={[autonomyStyles.toggle, value && autonomyStyles.toggleActive]}>
+        <View style={[autonomyStyles.toggleThumb, value && autonomyStyles.toggleThumbActive]} />
+      </View>
+    </TouchableOpacity>
+  );
+}
+// Add this as a separate StyleSheet outside the main styles
+const autonomyStyles = StyleSheet.create({
+  panel: {
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: 'rgba(122,62,184,0.38)',
+    backgroundColor: 'rgba(122,62,184,0.07)',
+    padding: 16,
+    gap: 12,
+  },
+  panelKicker: {
+    color: '#7A3EB8',
+    fontSize: 11,
+    fontWeight: '900',
+    letterSpacing: 2,
+  },
+  panelTitle: {
+    color: '#FDFBF7',
+    fontSize: 18,
+    fontWeight: '900',
+    lineHeight: 24,
+  },
+  panelBody: {
+    color: '#A299A8',
+    fontSize: 13,
+    lineHeight: 19,
+  },
+  mandateRef: {
+    color: '#6D6175',
+    fontSize: 11,
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+  },
+  toggleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#2A2432',
+    backgroundColor: '#141018',
+    padding: 14,
+    gap: 12,
+  },
+  toggleLabel: {
+    color: '#C8C0CE',
+    fontSize: 13,
+    flex: 1,
+    lineHeight: 18,
+  },
+  toggle: {
+    width: 44,
+    height: 26,
+    borderRadius: 13,
+    backgroundColor: '#2A2432',
+    justifyContent: 'center',
+    paddingHorizontal: 3,
+  },
+  toggleActive: {
+    backgroundColor: 'rgba(122,62,184,0.6)',
+    borderColor: '#7A3EB8',
+    borderWidth: 1,
+  },
+  toggleThumb: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: '#6D6175',
+  },
+  toggleThumbActive: {
+    backgroundColor: '#FDFBF7',
+    transform: [{ translateX: 18 }],
+  },
+  scoreRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#2A2432',
+    backgroundColor: '#141018',
+    padding: 14,
+  },
+  scoreLabel: {
+    color: '#C8C0CE',
+    fontSize: 13,
+    flex: 1,
+  },
+  scoreInput: {
+    width: 52,
+    backgroundColor: '#0D0B10',
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#2A2432',
+    color: '#FDFBF7',
+    fontSize: 16,
+    fontWeight: '800',
+    textAlign: 'center',
+    padding: 8,
+  },
+  scoreUnit: {
+    color: '#A299A8',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  statusMsg: {
+    color: '#A299A8',
+    fontSize: 12,
+    fontStyle: 'italic',
+    textAlign: 'center',
+  },
+  activateButton: {
+    height: 48,
+    borderRadius: 15,
+    backgroundColor: '#7A3EB8',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 4,
+  },
+  activateButtonDisabled: {
+    opacity: 0.6,
+  },
+  activateButtonText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '900',
+  },
+});
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: '#0D0B10' },
   loading: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 12 },
