@@ -1,13 +1,22 @@
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
-import { generateNonce, generateRandomness } from '@mysten/sui/zklogin';
+import { generateNonce, generateRandomness, getZkLoginSignature } from '@mysten/sui/zklogin';
 import { toBase64 } from '@mysten/sui/utils';
 import { Platform } from 'react-native';
+import { Transaction } from '@mysten/sui/transactions';
+import * as AuthSession from 'expo-auth-session';
+import * as WebBrowser from 'expo-web-browser';
 
+WebBrowser.maybeCompleteAuthSession();
 
 const ENOKI_BASE_URL = 'https://api.enoki.mystenlabs.com/v1';
 const ENOKI_PUBLIC_API_KEY = process.env.EXPO_PUBLIC_ENOKI_API_KEY || '';
+const GOOGLE_CLIENT_ID = process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID || '';
 const SUI_NETWORK = 'testnet';
+
+const discovery = {
+  authorizationEndpoint: 'https://accounts.google.com/o/oauth2/v2/auth',
+};
 
 const storage = {
   async setItem(key: string, value: string) {
@@ -15,7 +24,6 @@ const storage = {
       localStorage.setItem(key, value);
       return;
     }
-
     const SecureStore = await import('expo-secure-store');
     await SecureStore.setItemAsync(key, value);
   },
@@ -24,7 +32,6 @@ const storage = {
     if (Platform.OS === 'web') {
       return localStorage.getItem(key);
     }
-
     const SecureStore = await import('expo-secure-store');
     return SecureStore.getItemAsync(key);
   },
@@ -34,13 +41,12 @@ const storage = {
       localStorage.removeItem(key);
       return;
     }
-
     const SecureStore = await import('expo-secure-store');
     await SecureStore.deleteItemAsync(key);
   },
 };
 
-const client = new SuiJsonRpcClient({
+export const client = new SuiJsonRpcClient({
   url: getJsonRpcFullnodeUrl(SUI_NETWORK),
   network: SUI_NETWORK,
 });
@@ -174,4 +180,88 @@ export const fetchZkProof = async (
     userSalt: user.salt,
     userAddress: user.address,
   };
+};
+
+// ─── Exported transaction helpers ─────────────────────────────────────────────
+//
+// These were previously inlined in morning-briefing.tsx.
+// They live here now so any service (matchSync, etc.) can import them
+// without pulling in the entire screen component.
+
+/**
+ * Prompts the user with a Google OAuth popup and returns an id_token JWT.
+ * Used as the first step before any zkLogin-signed transaction.
+ */
+export const getJwtForTransaction = async (): Promise<string> => {
+  if (!GOOGLE_CLIENT_ID) throw new Error('Missing EXPO_PUBLIC_GOOGLE_CLIENT_ID');
+
+  const { nonce } = await setupZkLoginParams();
+  const redirectUri = AuthSession.makeRedirectUri();
+
+  const request = new AuthSession.AuthRequest({
+    clientId: GOOGLE_CLIENT_ID,
+    responseType: AuthSession.ResponseType.IdToken,
+    scopes: ['openid', 'email', 'profile'],
+    redirectUri,
+    extraParams: { nonce, prompt: 'select_account' },
+    usePKCE: false,
+  });
+
+  const result = await request.promptAsync(discovery);
+
+  if (result.type !== 'success') throw new Error('Google sign-in was cancelled');
+  if (!result.params.id_token) throw new Error('No id_token in Google response');
+
+  return result.params.id_token;
+};
+
+/**
+ * Signs and executes a Transaction using the current zkLogin session.
+ *
+ * @param tx           - The pre-built Transaction object
+ * @param expectedOwner - The Sui address this session must match
+ * @param jwt           - The id_token from getJwtForTransaction()
+ *
+ * Throws if the Google account selected doesn't match expectedOwner.
+ * Throws if ZK params are missing (session expired).
+ */
+export const executeZkLoginTransaction = async (
+  tx: Transaction,
+  expectedOwner: string,
+  jwt: string,
+) => {
+  const { ephemeralKeyPair, maxEpoch, randomness } = await loadZkLoginParams();
+  const { zkProof, addressSeed, userAddress } = await fetchZkProof(
+    jwt,
+    ephemeralKeyPair,
+    maxEpoch,
+    randomness,
+  );
+
+  if (userAddress.toLowerCase() !== expectedOwner.toLowerCase()) {
+    throw new Error('Selected Google account does not match this browser identity.');
+  }
+
+  tx.setSender(userAddress);
+
+  const { bytes, signature: userSignature } = await tx.sign({
+    client,
+    signer: ephemeralKeyPair,
+  });
+
+  const zkSignature = getZkLoginSignature({
+    inputs: { ...(zkProof as any), addressSeed },
+    maxEpoch,
+    userSignature,
+  });
+
+  return client.executeTransactionBlock({
+    transactionBlock: bytes,
+    signature: zkSignature,
+    options: {
+      showEffects: true,
+      showEvents: true,
+      showObjectChanges: true,
+    },
+  });
 };
