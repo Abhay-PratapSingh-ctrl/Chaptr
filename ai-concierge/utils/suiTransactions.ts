@@ -118,3 +118,72 @@ export const buildEndMatchTx = (matchId: string) => {
 
   return tx;
 };
+export const buildCreateMandateTx = (
+  mayScout: boolean,
+  mayRunA2A: boolean,
+  mayPropose: boolean,
+  minScoreToPropose: number,
+) => {
+  const MANDATE_PACKAGE_ID = process.env.EXPO_PUBLIC_MANDATE_PACKAGE_ID || PACKAGE_ID;
+  const tx = new Transaction();
+
+  tx.moveCall({
+    target: `${MANDATE_PACKAGE_ID}::mandate::create_mandate`,
+    arguments: [
+      tx.pure.bool(mayScout),
+      tx.pure.bool(mayRunA2A),
+      tx.pure.bool(mayPropose),
+      tx.pure.u8(Math.max(70, Math.min(99, minScoreToPropose))),
+    ],
+  });
+
+  return tx;
+};
+
+export const buildUpdateMandateTx = (
+  mandateId: string,
+  mayScout: boolean,
+  mayRunA2A: boolean,
+  mayPropose: boolean,
+  minScoreToPropose: number,
+) => {
+  const MANDATE_PACKAGE_ID = process.env.EXPO_PUBLIC_MANDATE_PACKAGE_ID || PACKAGE_ID;
+  const tx = new Transaction();
+
+  tx.moveCall({
+    target: `${MANDATE_PACKAGE_ID}::mandate::update_mandate`,
+    arguments: [
+      tx.object(mandateId),
+      tx.pure.bool(mayScout),
+      tx.pure.bool(mayRunA2A),
+      tx.pure.bool(mayPropose),
+      tx.pure.u8(Math.max(70, Math.min(99, minScoreToPropose))),
+    ],
+  });
+
+  return tx;
+};
+
+export const buildRecordA2AResultTx = (
+  mandateId: string,
+  partnerOwner: string,
+  transcriptRef: string,
+  reportRef: string,
+  score: number,
+) => {
+  const MANDATE_PACKAGE_ID = process.env.EXPO_PUBLIC_MANDATE_PACKAGE_ID || PACKAGE_ID;
+  const tx = new Transaction();
+
+  tx.moveCall({
+    target: `${MANDATE_PACKAGE_ID}::mandate::record_a2a_result`,
+    arguments: [
+      tx.object(mandateId),
+      tx.pure.address(partnerOwner),
+      tx.pure.string(transcriptRef),
+      tx.pure.string(reportRef),
+      tx.pure.u8(Math.max(0, Math.min(99, Math.round(score)))),
+    ],
+  });
+
+  return tx;
+};
