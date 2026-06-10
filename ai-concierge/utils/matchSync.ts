@@ -5,15 +5,14 @@
  * Works for BOTH sides of a match (proposer and receiver) in ANY browser,
  * even if local storage is empty or stale.
  *
- * How it works:
- *   1. Query all MatchFormed events where my address is participant_a OR participant_b
- *   2. Query all MatchEnded events to exclude dead matches
- *   3. For each live match, try to enrich with Twin Pool data (name, scoutRef, twinId)
- *   4. Merge results into chaptr:human-matches without wiping manually added data
+ * Also powers the Agentic Web target autonomy by scanning for pending
+ * incoming proposals and auto-accepting them if they meet the user's Mandate.
  */
 
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
+import { buildAcceptProposalTx } from './suiTransactions';
+import { getJwtForTransaction, executeZkLoginTransaction } from './zkLoginService';
 
 const PACKAGE_ID = process.env.EXPO_PUBLIC_PACKAGE_ID || '';
 const TWIN_POOL_ID = process.env.EXPO_PUBLIC_TWIN_POOL_ID || '';
@@ -107,7 +106,6 @@ const fetchDisplayName = async (scoutRef: string): Promise<string | null> => {
 
 /**
  * Returns all MatchFormed events from the matchmaker module.
- * Each event has: match_id, participant_a, participant_b, score
  */
 const queryMatchFormedEvents = async () => {
   if (!PACKAGE_ID) return [];
@@ -146,8 +144,8 @@ const queryEndedMatchIds = async (): Promise<Set<string>> => {
     const ended = new Set<string>();
 
     for (const event of result.data ?? []) {
-        const parsed = event.parsedJson as Record<string, any> ?? {};
-        const matchId = toPlainString(parsed.match_id ?? parsed.matchId);
+      const parsed = (event.parsedJson as Record<string, any>) ?? {};
+      const matchId = toPlainString(parsed.match_id ?? parsed.matchId);
       if (matchId) ended.add(matchId.toLowerCase());
     }
 
@@ -158,17 +156,67 @@ const queryEndedMatchIds = async (): Promise<Set<string>> => {
   }
 };
 
-// ─── Main sync function ───────────────────────────────────────────────────────
+/**
+ * Returns all PENDING proposals where myOwner is the target.
+ *
+ * IMPORTANT: The event name here must match what matchmaker.move actually
+ * emits. If your contract emits `MatchProposal` or `ProposalCreated` instead
+ * of `MatchProposed`, update the MoveEventType string below.
+ *
+ * To verify: run `sui client events --package <PACKAGE_ID>` on testnet
+ * and check the event type names in the output.
+ */
+const queryPendingIncomingProposals = async (myOwner: string) => {
+  if (!PACKAGE_ID) return [];
+
+  try {
+    const result = await suiClient.queryEvents({
+      query: {
+        // ⚠️  Verify this matches your matchmaker.move event name exactly.
+        MoveEventType: `${PACKAGE_ID}::matchmaker::ProposalSent`,
+      },
+      limit: 50,
+      order: 'descending',
+    });
+
+    const pendingProposals = [];
+
+    for (const event of result.data ?? []) {
+      const parsed = (event.parsedJson as any) ?? {};
+      const target = toPlainString(parsed.to);
+
+      if (sameAddress(target, myOwner)) {
+        const proposalId = toPlainString(parsed.proposal_id);
+
+        if (!proposalId) continue;
+
+        pendingProposals.push({
+          id: proposalId,
+          proposer: toPlainString(parsed.from),
+          target,
+          compatibility_score: Number(parsed.score) || 0,
+        });
+      }
+    }
+
+    return pendingProposals;
+  } catch (err) {
+    console.warn('[matchSync] Pending proposals query failed:', err);
+    return [];
+  }
+};
+
+// ─── Main sync functions ──────────────────────────────────────────────────────
 
 /**
  * syncHumanMatchesFromSui
  *
  * Call this on every app focus. It:
- *   - Reads MatchFormed + MatchEnded events from Sui
- *   - Filters to only matches involving myOwner
- *   - Enriches with Twin Pool data (name, scoutRef, twinId)
- *   - Merges into local chaptr:human-matches
- *   - Returns the final merged match list
+ * - Reads MatchFormed + MatchEnded events from Sui
+ * - Filters to only matches involving myOwner
+ * - Enriches with Twin Pool data (name, scoutRef, twinId)
+ * - Merges into local chaptr:human-matches
+ * - Returns the final merged match list
  *
  * Safe to call multiple times — it merges, never wipes existing data.
  */
@@ -193,8 +241,12 @@ export const syncHumanMatchesFromSui = async (
       if (!matchId) return false;
       if (endedIds.has(matchId.toLowerCase())) return false;
 
-      const a = toPlainString(parsed.participant_a ?? parsed.owner_a ?? parsed.from);
-      const b = toPlainString(parsed.participant_b ?? parsed.owner_b ?? parsed.to);
+      const a = toPlainString(
+        parsed.participant_a ?? parsed.owner_a ?? parsed.from,
+      );
+      const b = toPlainString(
+        parsed.participant_b ?? parsed.owner_b ?? parsed.to,
+      );
 
       return sameAddress(a, myOwner) || sameAddress(b, myOwner);
     });
@@ -204,29 +256,40 @@ export const syncHumanMatchesFromSui = async (
       myEvents.map(async (event: any) => {
         const parsed = event.parsedJson ?? {};
 
-        const matchId = toPlainString(parsed.match_id ?? parsed.matchId ?? parsed.id);
-        const participantA = toPlainString(parsed.participant_a ?? parsed.owner_a ?? parsed.from);
-        const participantB = toPlainString(parsed.participant_b ?? parsed.owner_b ?? parsed.to);
+        const matchId = toPlainString(
+          parsed.match_id ?? parsed.matchId ?? parsed.id,
+        );
+        const participantA = toPlainString(
+          parsed.participant_a ?? parsed.owner_a ?? parsed.from,
+        );
+        const participantB = toPlainString(
+          parsed.participant_b ?? parsed.owner_b ?? parsed.to,
+        );
 
         // The "other" person is whoever is not me
-        const otherOwner = sameAddress(participantA, myOwner) ? participantB : participantA;
+        const otherOwner = sameAddress(participantA, myOwner)
+          ? participantB
+          : participantA;
 
         const score = Number(parsed.score ?? parsed.similarity_score) || 0;
         const txDigest = event.id?.txDigest ?? '';
         const timestampMs = event.timestampMs ?? null;
 
         // Enrich from pool
-        const poolEntry = poolEntries.find((e) => sameAddress(e.owner, otherOwner));
+        const poolEntry = poolEntries.find((e) =>
+          sameAddress(e.owner, otherOwner),
+        );
         let participantName = `${otherOwner.slice(0, 6)}...${otherOwner.slice(-4)}`;
 
         if (poolEntry?.scout_ref) {
-          const displayName = await fetchDisplayName(poolEntry.scout_ref).catch(() => null);
+          const displayName = await fetchDisplayName(
+            poolEntry.scout_ref,
+          ).catch(() => null);
           if (displayName) participantName = displayName;
         }
 
         return {
           matchId,
-          // MatchFormed doesn't emit proposalId — use matchId as fallback
           proposalId: matchId,
           participantOwner: otherOwner,
           participantTwinId: poolEntry?.twin_id ?? null,
@@ -242,7 +305,6 @@ export const syncHumanMatchesFromSui = async (
     );
 
     // Merge with existing local matches
-    // Local wins on proposalId and participantName if richer
     const localMatches = await readLocalMatches();
     const merged = mergeMatches(localMatches, chainMatches);
 
@@ -255,8 +317,120 @@ export const syncHumanMatchesFromSui = async (
 
     return live;
   } catch (err) {
-    console.warn('[matchSync] syncHumanMatchesFromSui failed, returning local:', err);
+    console.warn(
+      '[matchSync] syncHumanMatchesFromSui failed, returning local:',
+      err,
+    );
     return readLocalMatches();
+  }
+};
+
+/**
+ * processAutoAccepts
+ *
+ * Agentic Web target autonomy — closes the loop on the receiving side.
+ *
+ * How it works:
+ * 1. Queries MatchProposed events targeting myOwner
+ * 2. Fetches the user's on-chain Mandate to read may_propose + min_score_to_propose
+ * 3. For each proposal whose score meets the threshold, fires accept_proposal
+ *    using a single Google popup (one JWT covers all proposals in the loop)
+ * 4. Saves a guard key so each proposal is only accepted once, even if the
+ *    screen re-mounts before the chain confirms
+ *
+ * Gate: reuses may_propose === true as the opt-in signal for both directions.
+ * If you add a dedicated may_accept field to mandate.move, swap it in here.
+ *
+ * Call site: fire-and-forget from loadSavedState() in morning-briefing.tsx.
+ * It's non-blocking — failures are warned but never surface to the user.
+ */
+export const processAutoAccepts = async (myOwner: string): Promise<void> => {
+  const incomingProposals = await queryPendingIncomingProposals(myOwner);
+  if (incomingProposals.length === 0) return;
+
+  // Read mandate
+  const mandateIdStored = await AsyncStorage.getItem('chaptr:mandate-id');
+  let mandateFields: any = null;
+
+  if (mandateIdStored) {
+    try {
+      const mandateObj = await suiClient.getObject({
+        id: mandateIdStored,
+        options: { showContent: true },
+      });
+      mandateFields = (mandateObj.data?.content as any)?.fields ?? null;
+    } catch (err) {
+      console.warn('[Auto-Accept] Failed to fetch mandate:', err);
+      return;
+    }
+  }
+
+  // Opt-in gate: user must have enabled autonomous behaviour on their Mandate.
+  // We reuse may_propose as the "I want my Twin to act autonomously" flag for
+  // both outbound and inbound until a dedicated may_accept field is added.
+  if (mandateFields?.may_propose !== true) return;
+
+  const minScoreToAccept = Number(
+    mandateFields?.min_score_to_propose ?? 80,
+  );
+
+  // Read myTwinId — needed by accept_proposal (matchmaker.move requires it)
+  const myTwinId = await AsyncStorage.getItem('chaptr:my-twin-id');
+  if (!myTwinId) {
+    console.warn('[Auto-Accept] No local twin ID — cannot build accept tx');
+    return;
+  }
+
+  // Filter to proposals that clear the score bar AND haven't been accepted yet
+  const actionable = await Promise.all(
+    incomingProposals
+      .filter((p) => p.compatibility_score >= minScoreToAccept)
+      .map(async (p) => {
+        const guardKey = `chaptr:auto-accepted:${p.id.toLowerCase()}`;
+        const alreadyDone = await AsyncStorage.getItem(guardKey);
+        return alreadyDone ? null : p;
+      }),
+  );
+
+  const toProcess = actionable.filter(Boolean) as typeof incomingProposals;
+  if (toProcess.length === 0) return;
+
+  // One Google popup covers all proposals — reuse the JWT across the loop
+  let jwt: string;
+  try {
+    jwt = await getJwtForTransaction();
+  } catch (jwtErr) {
+    console.warn('[Auto-Accept] JWT auth failed (non-blocking):', jwtErr);
+    return;
+  }
+
+  for (const proposal of toProcess) {
+    console.log(
+      `[Auto-Accept] Twin evaluating proposal ${proposal.id.slice(0, 8)}… ` +
+      `Score ${proposal.compatibility_score}% ≥ threshold ${minScoreToAccept}%`,
+    );
+
+    try {
+      // buildAcceptProposalTx requires both the proposalId and myTwinId
+      const acceptTx = buildAcceptProposalTx(proposal.id, myTwinId);
+      await executeZkLoginTransaction(acceptTx, myOwner, jwt);
+
+      // Save guard key immediately after success so we never double-accept
+      await AsyncStorage.setItem(
+        `chaptr:auto-accepted:${proposal.id.toLowerCase()}`,
+        new Date().toISOString(),
+      );
+
+      console.log(
+        `[Auto-Accept] Autonomously accepted proposal from ${proposal.proposer.slice(0, 8)}!`,
+      );
+    } catch (txErr) {
+      // Non-blocking — log and continue to next proposal
+      console.warn(
+        `[Auto-Accept] Failed to accept proposal ${proposal.id}:`,
+        txErr,
+      );
+    }
   }
 };
 
@@ -266,10 +440,10 @@ export const syncHumanMatchesFromSui = async (
  * Merges local matches with chain-discovered matches.
  *
  * Rules:
- *   - Chain match wins on matchId (authoritative)
- *   - Local match wins on proposalId if it has a real proposalId (not just matchId fallback)
- *   - Local match wins on participantName if it was enriched at accept time
- *   - Deduplication by matchId, then by participantOwner
+ * - Chain match wins on matchId (authoritative)
+ * - Local match wins on proposalId if it has a real proposalId
+ * - Local match wins on participantName if it was enriched at accept time
+ * - Deduplication by matchId, then by participantOwner
  */
 const mergeMatches = (
   local: SyncedHumanMatch[],
@@ -288,15 +462,14 @@ const mergeMatches = (
     const existing = result.get(key);
 
     if (existing) {
-      // Prefer local proposalId if it differs from matchId (means it was captured at proposal time)
       const betterProposalId =
         localMatch.proposalId && localMatch.proposalId !== localMatch.matchId
           ? localMatch.proposalId
           : existing.proposalId;
 
-      // Prefer local name if it's a real name (not address truncation)
       const betterName =
-        localMatch.participantName && !localMatch.participantName.includes('...')
+        localMatch.participantName &&
+          !localMatch.participantName.includes('...')
           ? localMatch.participantName
           : existing.participantName;
 
@@ -304,16 +477,17 @@ const mergeMatches = (
         ...existing,
         proposalId: betterProposalId,
         participantName: betterName,
-        participantTwinId: localMatch.participantTwinId ?? existing.participantTwinId,
-        participantScoutRef: localMatch.participantScoutRef ?? existing.participantScoutRef,
+        participantTwinId:
+          localMatch.participantTwinId ?? existing.participantTwinId,
+        participantScoutRef:
+          localMatch.participantScoutRef ?? existing.participantScoutRef,
       });
     } else {
-      // Local match not found on chain yet (e.g. indexing delay) — keep it
+      // Local match not found on chain yet (indexing delay) — keep it
       result.set(key, localMatch);
     }
   }
 
-  // Sort newest first
   return Array.from(result.values()).sort(
     (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
   );
