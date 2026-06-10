@@ -18,15 +18,18 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { LinearGradient } from 'expo-linear-gradient';
 import { router, useFocusEffect, type Href } from 'expo-router';
 import * as WebBrowser from 'expo-web-browser';
-import * as AuthSession from 'expo-auth-session';
-import { Transaction } from '@mysten/sui/transactions';
-import { getZkLoginSignature } from '@mysten/sui/zklogin';
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
-import { buildWithdrawProposalTx } from '@/utils/suiTransactions';
+import {
+  buildWithdrawProposalTx,
+  buildRecordA2AResultTx,
+  buildProposeMatchTx,
+} from '@/utils/suiTransactions';
 import {
   fetchZkProof,
   loadZkLoginParams,
   setupZkLoginParams,
+  getJwtForTransaction,
+  executeZkLoginTransaction,
 } from '@/utils/zkLoginService';
 import {
   readBlockedProfileKeys,
@@ -38,7 +41,7 @@ import {
   loadLocalScoutCapsule,
   type ScoutCapsule,
 } from '@/utils/twinMemory';
-import { syncHumanMatchesFromSui } from '@/utils/matchSync';
+import { syncHumanMatchesFromSui, processAutoAccepts } from '@/utils/matchSync';
 
 const AGGREGATOR = 'https://aggregator.walrus-testnet.walrus.space';
 const PUBLISHER = 'https://publisher.walrus-testnet.walrus.space';
@@ -48,7 +51,6 @@ const GEMINI_API_KEY = process.env.EXPO_PUBLIC_GEMINI_API_KEY || '';
 const GEMINI_MODEL = process.env.EXPO_PUBLIC_GEMINI_MODEL || 'gemini-2.5-flash-lite';
 const REPORT_FEEDBACK_KEY = 'chaptr:report-feedback-ids';
 
-const SUI_EXPLORER = 'https://suiscan.xyz/testnet';
 const WALRUS_AGGREGATOR = 'https://aggregator.walrus-testnet.walrus.space/v1/blobs';
 
 WebBrowser.maybeCompleteAuthSession();
@@ -185,6 +187,10 @@ interface PassedEntry {
   score: number;
   reportRef?: string | null;
   scoutRef: string;
+  a2aTranscriptRef?: string | null;
+  a2aScore?: number;
+  a2aSummary?: string;
+  autoProposed?: boolean;
 }
 
 interface PoolScanLog {
@@ -364,39 +370,9 @@ const syncActiveProposalAcceptance = async (
   return { proposal: null, matches: nextMatches };
 };
 
-const getJwtForTransaction = async (): Promise<string> => {
-  if (!GOOGLE_CLIENT_ID) throw new Error('Missing EXPO_PUBLIC_GOOGLE_CLIENT_ID');
-  const { nonce } = await setupZkLoginParams();
-  const redirectUri = AuthSession.makeRedirectUri();
-  const request = new AuthSession.AuthRequest({
-    clientId: GOOGLE_CLIENT_ID,
-    responseType: AuthSession.ResponseType.IdToken,
-    scopes: ['openid', 'email', 'profile'],
-    redirectUri,
-    extraParams: { nonce, prompt: 'select_account' },
-    usePKCE: false,
-  });
-  const result = await request.promptAsync(discovery);
-  if (result.type !== 'success') throw new Error('Google sign-in was cancelled');
-  if (!result.params.id_token) throw new Error('No id_token in Google response');
-  return result.params.id_token;
-};
+// getJwtForTransaction — imported from zkLoginService
 
-const executeZkLoginTransaction = async (tx: Transaction, expectedOwner: string, jwt: string) => {
-  const { ephemeralKeyPair, maxEpoch, randomness } = await loadZkLoginParams();
-  const { zkProof, addressSeed, userAddress } = await fetchZkProof(jwt, ephemeralKeyPair, maxEpoch, randomness);
-  if (userAddress.toLowerCase() !== expectedOwner.toLowerCase()) {
-    throw new Error('Selected Google account does not match this browser identity.');
-  }
-  tx.setSender(userAddress);
-  const { bytes, signature: userSignature } = await tx.sign({ client: suiClient, signer: ephemeralKeyPair });
-  const zkSignature = getZkLoginSignature({ inputs: { ...(zkProof as any), addressSeed }, maxEpoch, userSignature });
-  return suiClient.executeTransactionBlock({
-    transactionBlock: bytes,
-    signature: zkSignature,
-    options: { showEffects: true, showEvents: true, showObjectChanges: true },
-  });
-};
+// executeZkLoginTransaction — imported from zkLoginService
 
 const cleanPhrase = (value?: string | null) =>
   (value ?? '').trim().replace(/[.!?]+$/g, '').toLowerCase();
@@ -681,10 +657,8 @@ function ActivityLogModal({
       <View style={modalStyles.overlay}>
         <TouchableOpacity style={modalStyles.backdrop} onPress={onClose} activeOpacity={1} />
         <View style={modalStyles.sheet}>
-          {/* Handle */}
           <View style={modalStyles.handle} />
 
-          {/* Header */}
           <View style={modalStyles.header}>
             <View>
               <Text style={modalStyles.title}>Twin Activity Log</Text>
@@ -760,7 +734,7 @@ function ActivityLogModal({
                       <View key={i} style={modalStyles.passedRow}>
                         <View style={modalStyles.passedLeft}>
                           <Text style={modalStyles.passedIcon}>✦</Text>
-                          <View>
+                          <View style={{ flex: 1 }}>
                             <Text style={modalStyles.passedName}>{p.name}</Text>
                             <View style={modalStyles.passedLinks}>
                               <TouchableOpacity
@@ -777,7 +751,23 @@ function ActivityLogModal({
                                   <Text style={modalStyles.linkBtnText}>Scout report ↗</Text>
                                 </TouchableOpacity>
                               )}
+                              {p.a2aTranscriptRef && (
+                                <TouchableOpacity
+                                  onPress={() => openLink(`${WALRUS_AGGREGATOR}/${p.a2aTranscriptRef}`)}
+                                  style={modalStyles.linkBtn}
+                                >
+                                  <Text style={[modalStyles.linkBtnText, { color: '#a78bfa' }]}>A2A transcript ↗</Text>
+                                </TouchableOpacity>
+                              )}
+                              {p.autoProposed && (
+                                <View style={[modalStyles.linkBtn, { borderColor: 'rgba(167,139,250,0.35)', backgroundColor: 'rgba(167,139,250,0.1)' }]}>
+                                  <Text style={[modalStyles.linkBtnText, { color: '#a78bfa' }]}>⚡ Auto-proposed</Text>
+                                </View>
+                              )}
                             </View>
+                            {p.a2aSummary ? (
+                              <Text style={modalStyles.a2aSummaryText}>{p.a2aSummary}</Text>
+                            ) : null}
                           </View>
                         </View>
                         <View style={modalStyles.scorePill}>
@@ -891,19 +881,51 @@ export default function MorningBriefingScreen() {
       const fetchedMyScout = myScoutRef ? await fetchScoutProfile(myScoutRef).catch(() => null) : null;
       const myScout = fetchedMyScout
         ? {
-            ...fetchedMyScout,
-            scoutCapsule: {
-              ...(fetchedMyScout.scoutCapsule ?? localScoutCapsule ?? undefined),
-              feedbackHistory: localScoutCapsule?.feedbackHistory ?? fetchedMyScout.scoutCapsule?.feedbackHistory,
-            } as ScoutCapsule,
-          }
+          ...fetchedMyScout,
+          scoutCapsule: {
+            ...(fetchedMyScout.scoutCapsule ?? localScoutCapsule ?? undefined),
+            feedbackHistory: localScoutCapsule?.feedbackHistory ?? fetchedMyScout.scoutCapsule?.feedbackHistory,
+          } as ScoutCapsule,
+        }
         : null;
 
       // ── Instrumented pool scan ────────────────────────────────────────────
       const filteredLog: FilteredEntry[] = [];
       const passedLog: PassedEntry[] = [];
 
-      const settled = await Promise.allSettled(
+      // Read mandate once outside the loop for efficiency
+      const mandateIdStored = await AsyncStorage.getItem('chaptr:mandate-id');
+      const isInActiveMatch = activeMatchedOwners.size > 0 &&
+        [...activeMatchedOwners].some(o => sameAddress(o, myOwner ?? ''));
+
+      let mandateFields: any = null;
+      if (mandateIdStored && !isInActiveMatch) {
+        try {
+          const mandateObj = await suiClient.getObject({
+            id: mandateIdStored,
+            options: { showContent: true },
+          });
+          mandateFields = (mandateObj.data?.content as any)?.fields ?? null;
+        } catch (err) {
+          console.warn('[A2A] Mandate fetch failed (non-blocking):', err);
+        }
+      }
+
+      // ── Phase 1: parallel scout scan (no A2A, no Groq) ───────────────────
+      // Each entry fetches its scout profile and generates/loads a scout report.
+      // A2A is intentionally excluded here — it runs sequentially in Phase 2.
+
+      interface ScoutedEntry {
+        entry: PoolEntry;
+        scout: ScoutProfile;
+        baseProfile: Profile;
+        report: ScoutReport;
+        reportRef: string | null;
+      }
+
+      const scoutedEntries: ScoutedEntry[] = [];
+
+      const scoutSettled = await Promise.allSettled(
         entries.map(async (entry) => {
           // Skip self
           if (myOwner && sameAddress(entry.owner, myOwner)) {
@@ -911,9 +933,7 @@ export default function MorningBriefingScreen() {
             return null;
           }
 
-          const entryKeys = [entry.owner, entry.twin_id].map((value) => value.toLowerCase());
-
-          // Skip blocked or hidden
+          const entryKeys = [entry.owner, entry.twin_id].map((v) => v.toLowerCase());
           if (
             entryKeys.some((key) => blockedKeySet.has(key)) ||
             hiddenProfileIdSet.has(entry.twin_id.toLowerCase())
@@ -922,23 +942,20 @@ export default function MorningBriefingScreen() {
             return null;
           }
 
-          // Skip currently matched
           if (activeMatchedOwners.has(entry.owner.toLowerCase())) {
             filteredLog.push({ owner: entry.owner, reason: 'matched' });
             return null;
           }
 
-          // Fetch scout profile — skip if unavailable
           let scout: ScoutProfile;
           try {
             scout = await fetchScoutProfile(entry.scout_ref);
           } catch {
-            console.warn(`[pool] Scout fetch failed for ${entry.owner.slice(0, 10)}, scout_ref: ${entry.scout_ref}`);
+            console.warn(`[pool] Scout fetch failed for ${entry.owner.slice(0, 10)}`);
             filteredLog.push({ owner: entry.owner, reason: 'fetch_failed' });
             return null;
           }
 
-          // Gender/interest filter
           const theyWantMe = matchesInterest(scout.interestedIn, myGender);
           const iWantThem = matchesInterest(myInterestedIn, scout.gender);
           if (!theyWantMe || !iWantThem) {
@@ -950,7 +967,7 @@ export default function MorningBriefingScreen() {
 
           if (!myScout) {
             passedLog.push({ name: baseProfile.name, score: baseProfile.compatibility, scoutRef: entry.scout_ref });
-            return baseProfile;
+            return { entry, scout, baseProfile, report: null as any, reportRef: null };
           }
 
           const { report, reportRef } = await loadOrCreateScoutReport(
@@ -960,21 +977,139 @@ export default function MorningBriefingScreen() {
             scout,
           );
 
-          passedLog.push({
-            name: baseProfile.name,
-            score: report.score,
-            reportRef,
-            scoutRef: entry.scout_ref,
-          });
-
-          return {
-            ...baseProfile,
-            compatibility: report.score,
-            report,
-            reportRef: reportRef ?? undefined,
-          };
+          return { entry, scout, baseProfile, report, reportRef } as ScoutedEntry;
         }),
       );
+
+      for (const result of scoutSettled) {
+        if (result.status === 'fulfilled' && result.value) {
+          scoutedEntries.push(result.value);
+        }
+      }
+
+      // ── Phase 2: sequential A2A (one at a time, cache-first) ─────────────
+      // Runs only if Mandate allows. Each candidate is processed serially so
+      // Groq rate limits are never hit. Cache is checked first — if a result
+      // exists from a prior session it is returned instantly with no API call.
+
+      // FIX: split propose actions from record actions so Phase 4 can skip
+      // record_a2a_result entirely, cutting Enoki proof generation in half.
+      // record_a2a_result is informational; propose_match is what matters for the demo.
+      interface ProposeAction {
+        kind: 'propose';
+        mandateIdStored: string;
+        entryOwner: string;
+        transcriptRef: string;
+        reportRef: string;
+        score: number;
+        twinId: string;
+      }
+
+      interface RecordAction {
+        kind: 'record';
+        mandateIdStored: string;
+        entryOwner: string;
+        transcriptRef: string;
+        reportRef: string;
+        score: number;
+      }
+
+      type PendingAction = ProposeAction | RecordAction;
+
+      const a2aPendingActions: PendingAction[] = [];
+
+      // Map from candidateOwner → a2aResult for merging into profiles below
+      const a2aResultMap = new Map<string, any>();
+
+      if (mandateFields?.may_run_a2a === true && myScout && myOwner) {
+        const { runA2AConversation, getCachedA2AResult } = await import('@/utils/aiEngine');
+        const myTwinId = await AsyncStorage.getItem('chaptr:my-twin-id');
+        const minScoreToPropose = Number(mandateFields?.min_score_to_propose ?? 80);
+
+        for (const scouted of scoutedEntries) {
+          const { entry, scout } = scouted;
+          try {
+            const cached = await getCachedA2AResult(myOwner, entry.owner);
+            if (cached) {
+              console.log('[A2A] Using cached result for', entry.owner.slice(0, 10));
+            } else {
+              console.log('[A2A] Running conversation with', entry.owner.slice(0, 10));
+            }
+
+            const a2aResult = await runA2AConversation(
+              { ...myScout, owner: myOwner },
+              { ...scout, owner: entry.owner },
+            );
+
+            a2aResultMap.set(entry.owner.toLowerCase(), a2aResult);
+
+            // Queue record_a2a_result only for fresh (non-cached) results.
+            // These are intentionally NOT fired in Phase 4 to avoid hitting
+            // Enoki's per-user ZK proof limit. They are kept in the actions
+            // list for future use when batching is available, but Phase 4
+            // skips them. Remove this block entirely if recording is not needed.
+            if (a2aResult.transcriptRef && a2aResult.reportRef && mandateIdStored && !cached) {
+              a2aPendingActions.push({
+                kind: 'record',
+                mandateIdStored,
+                entryOwner: entry.owner,
+                transcriptRef: a2aResult.transcriptRef,
+                reportRef: a2aResult.reportRef,
+                score: a2aResult.score,
+              });
+            }
+
+            // Queue propose independently of cache status — always check
+            // if we should propose based on score, guarded by the
+            // chaptr:auto-proposed key so we never double-propose.
+            const shouldPropose =
+              mandateFields.may_propose === true &&
+              a2aResult.score >= minScoreToPropose;
+
+            if (shouldPropose && myTwinId && mandateIdStored) {
+              const proposedKey = `chaptr:auto-proposed:${entry.owner.toLowerCase()}`;
+              const alreadyProposed = await AsyncStorage.getItem(proposedKey);
+              if (!alreadyProposed) {
+                a2aPendingActions.push({
+                  kind: 'propose',
+                  mandateIdStored,
+                  entryOwner: entry.owner,
+                  transcriptRef: a2aResult.transcriptRef ?? '',
+                  reportRef: a2aResult.reportRef ?? '',
+                  score: a2aResult.score,
+                  twinId: myTwinId,
+                });
+              }
+            }
+          } catch (a2aErr) {
+            console.warn('[A2A] Conversation failed for', entry.owner.slice(0, 10), a2aErr);
+          }
+        }
+      }
+
+      // ── Phase 3: merge scout + A2A results into final profiles ───────────
+
+      for (const scouted of scoutedEntries) {
+        const { entry, baseProfile, report, reportRef } = scouted;
+        const a2aResult = a2aResultMap.get(entry.owner.toLowerCase()) ?? null;
+        const minScoreToPropose = Number(mandateFields?.min_score_to_propose ?? 80);
+
+        passedLog.push({
+          name: baseProfile.name,
+          score: a2aResult?.score ?? report?.score ?? baseProfile.compatibility,
+          reportRef: a2aResult?.reportRef ?? reportRef,
+          scoutRef: entry.scout_ref,
+          ...(a2aResult ? {
+            a2aTranscriptRef: a2aResult.transcriptRef,
+            a2aScore: a2aResult.score,
+            a2aSummary: a2aResult.summary,
+            autoProposed: Boolean(
+              mandateFields?.may_propose === true &&
+              a2aResult.score >= minScoreToPropose,
+            ),
+          } : {}),
+        });
+      }
 
       // Save pool scan log for activity modal
       setPoolScanLog({
@@ -984,13 +1119,88 @@ export default function MorningBriefingScreen() {
         passed: passedLog,
       });
 
-      const resolved = settled
-        .filter((r): r is PromiseFulfilledResult<Profile | null> => r.status === 'fulfilled')
-        .map((r) => r.value)
-        .filter((p): p is Profile => p !== null)
+      const resolvedProfiles: Profile[] = scoutedEntries
+        .map(({ entry, baseProfile, report, reportRef }) => {
+          const a2aResult = a2aResultMap.get(entry.owner.toLowerCase()) ?? null;
+          return {
+            ...baseProfile,
+            compatibility: a2aResult?.score ?? report?.score ?? baseProfile.compatibility,
+            report: report ?? undefined,
+            reportRef: (a2aResult?.reportRef ?? reportRef ?? undefined) as string | undefined,
+          };
+        })
         .sort((a, b) => b.compatibility - a.compatibility);
 
-      setProfiles(resolved);
+      setProfiles(resolvedProfiles);
+      // Save for Judge Dashboard
+      const topEntry = scoutedEntries[0];
+      if (topEntry) {
+        const a2aResult = a2aResultMap.get(topEntry.entry.owner.toLowerCase());
+        await AsyncStorage.setItem('chaptr:judge-data', JSON.stringify({
+          scoutRefA: myScoutRef ?? null,
+          scoutRefB: topEntry.entry.scout_ref,
+          transcriptRef: a2aResult?.transcriptRef ?? null,
+          reportRef: a2aResult?.reportRef ?? null,
+          score: a2aResult?.score ?? topEntry.report?.score ?? null,
+          summary: a2aResult?.summary ?? null,
+          chemistry: a2aResult?.chemistry ?? null,
+          redFlags: a2aResult?.redFlags ?? null,
+          recommendation: a2aResult?.recommendation ?? null,
+          txDigest: null,
+          mandateId: mandateIdStored ?? null,
+        }));
+      }
+
+      // ── Phase 4: fire on-chain propose actions only (ONE Google popup) ────
+      //
+      // CRITICAL FIX for Enoki 429 / popup-on-every-navigation bug:
+      //
+      // We intentionally skip 'record' actions here. Each executeZkLoginTransaction
+      // call costs one Enoki ZK proof generation. The free tier limit is tight —
+      // with 2 candidates, firing both record + propose = 4 proofs per scan.
+      // Skipping record cuts that to 1 proof per candidate (only the propose).
+      //
+      // The popup re-fires on every navigation because if a 429 kills the tx
+      // before AsyncStorage.setItem('chaptr:auto-proposed:...') runs, the guard
+      // key never gets saved and the propose is retried every useFocusEffect.
+      // Reducing to 1 proof per propose makes it far less likely to 429, so
+      // the guard key gets saved and the loop stops.
+      //
+      // If you need record_a2a_result back: batch it into the same tx as
+      // propose_match using a PTB (Programmable Transaction Block) so both
+      // actions consume only 1 proof instead of 2.
+
+      const proposeActions = a2aPendingActions.filter(
+        (action): action is ProposeAction => action.kind === 'propose',
+      );
+
+      if (proposeActions.length > 0 && myOwner) {
+        try {
+          const jwt = await getJwtForTransaction();
+          for (const action of proposeActions) {
+            try {
+              const proposeTx = buildProposeMatchTx(
+                action.twinId,
+                action.entryOwner,
+                action.score,
+                `Your Twin scored ${action.score}% in an A2A conversation. No human was involved.`,
+              );
+              await executeZkLoginTransaction(proposeTx, myOwner, jwt);
+              // Save the guard key immediately after success so we never
+              // re-propose this candidate, even if the tab is closed mid-loop.
+              await AsyncStorage.setItem(
+                `chaptr:auto-proposed:${action.entryOwner.toLowerCase()}`,
+                new Date().toISOString(),
+              );
+              console.log('[A2A] Auto-proposed to', action.entryOwner, 'score:', action.score);
+            } catch (actionErr) {
+              console.warn('[A2A] Propose failed (non-blocking):', actionErr);
+            }
+          }
+        } catch (jwtErr) {
+          console.warn('[A2A] Post-scan JWT failed (non-blocking):', jwtErr);
+        }
+      }
     } catch (err: any) {
       console.error('Failed to load pool profiles:', err);
       setError('Could not load your briefing. Check your connection.');
@@ -1010,9 +1220,9 @@ export default function MorningBriefingScreen() {
     setReportFeedbackIds(reportFeedback);
     const chainMatches = myOwner
       ? await syncHumanMatchesFromSui(myOwner).catch((err) => {
-          console.warn('[loadSavedState] chain sync failed, reading local:', err);
-          return readHumanMatches();
-        })
+        console.warn('[loadSavedState] chain sync failed, reading local:', err);
+        return readHumanMatches();
+      })
       : await readHumanMatches();
     const synced = await syncActiveProposalAcceptance(proposal, chainMatches, myOwner).catch((syncError) => {
       console.warn('Accepted match sync failed:', syncError);
@@ -1022,6 +1232,14 @@ export default function MorningBriefingScreen() {
     setUnlockedProfileIds(unlocked);
     setActiveProposal(synced.proposal);
     setHumanMatches(synced.matches);
+
+    // ── Agentic Web: auto-accept incoming proposals that meet mandate threshold
+    // Fire-and-forget — has its own JWT flow and guard keys internally.
+    if (myOwner) {
+      processAutoAccepts(myOwner).catch((err) =>
+        console.warn('[Auto-Accept] processAutoAccepts failed (non-blocking):', err),
+      );
+    }
   }, []);
 
   useFocusEffect(
@@ -1352,7 +1570,6 @@ export default function MorningBriefingScreen() {
         <View style={styles.headerRow}>
           <Text style={styles.logoText}>Chaptr.</Text>
           <View style={styles.headerActions}>
-            {/* Activity Log button */}
             <TouchableOpacity
               style={[styles.pillButton, styles.pillButtonActivity]}
               onPress={() => setShowActivityLog(true)}
@@ -1360,7 +1577,9 @@ export default function MorningBriefingScreen() {
             >
               <Text style={[styles.pillButtonText, styles.pillButtonActivityText]}>🤖 Activity</Text>
             </TouchableOpacity>
-
+            <TouchableOpacity style={[styles.pillButton, { borderColor: 'rgba(122,62,184,0.4)', backgroundColor: 'rgba(122,62,184,0.08)' }]} onPress={() => router.push('/judge' as Href)} activeOpacity={0.85}>
+              <Text style={[styles.pillButtonText, { color: '#a78bfa' }]}>🏛 Judge</Text>
+            </TouchableOpacity>
             <TouchableOpacity style={styles.pillButton} onPress={openTraining} activeOpacity={0.85}>
               <Text style={styles.pillButtonText}>Training</Text>
             </TouchableOpacity>
@@ -1481,14 +1700,8 @@ export default function MorningBriefingScreen() {
 // ─── Modal Styles ─────────────────────────────────────────────────────────────
 
 const modalStyles = StyleSheet.create({
-  overlay: {
-    flex: 1,
-    justifyContent: 'flex-end',
-  },
-  backdrop: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(0,0,0,0.6)',
-  },
+  overlay: { flex: 1, justifyContent: 'flex-end' },
+  backdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.6)' },
   sheet: {
     backgroundColor: '#12101A',
     borderTopLeftRadius: 28,
@@ -1498,171 +1711,50 @@ const modalStyles = StyleSheet.create({
     maxHeight: '80%',
     paddingBottom: 32,
   },
-  handle: {
-    width: 36,
-    height: 4,
-    borderRadius: 2,
-    backgroundColor: '#333',
-    alignSelf: 'center',
-    marginTop: 12,
-    marginBottom: 4,
-  },
-  header: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    justifyContent: 'space-between',
-    paddingHorizontal: 20,
-    paddingVertical: 16,
-    borderBottomWidth: 1,
-    borderBottomColor: 'rgba(255,255,255,0.06)',
-  },
-  title: {
-    color: '#FDFBF7',
-    fontSize: 18,
-    fontWeight: '800',
-  },
-  subtitle: {
-    color: '#6B6478',
-    fontSize: 12,
-    marginTop: 2,
-  },
-  closeBtn: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    backgroundColor: '#1E1B26',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  closeBtnText: {
-    color: '#888',
-    fontSize: 13,
-    fontWeight: '700',
-  },
-  scroll: {
-    padding: 20,
-    gap: 12,
-  },
-  emptyState: {
-    alignItems: 'center',
-    paddingVertical: 40,
-    gap: 10,
-  },
+  handle: { width: 36, height: 4, borderRadius: 2, backgroundColor: '#333', alignSelf: 'center', marginTop: 12, marginBottom: 4 },
+  header: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', paddingHorizontal: 20, paddingVertical: 16, borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.06)' },
+  title: { color: '#FDFBF7', fontSize: 18, fontWeight: '800' },
+  subtitle: { color: '#6B6478', fontSize: 12, marginTop: 2 },
+  closeBtn: { width: 32, height: 32, borderRadius: 16, backgroundColor: '#1E1B26', alignItems: 'center', justifyContent: 'center' },
+  closeBtnText: { color: '#888', fontSize: 13, fontWeight: '700' },
+  scroll: { padding: 20, gap: 12 },
+  emptyState: { alignItems: 'center', paddingVertical: 40, gap: 10 },
   emptyIcon: { fontSize: 36 },
   emptyTitle: { color: '#FDFBF7', fontSize: 16, fontWeight: '800' },
   emptyBody: { color: '#6B6478', fontSize: 13, textAlign: 'center', lineHeight: 18 },
-  sectionHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
-    marginBottom: 4,
-  },
-  sectionIconWrap: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: 'rgba(217,74,140,0.15)',
-    borderWidth: 1,
-    borderColor: 'rgba(217,74,140,0.3)',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
+  sectionHeader: { flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 4 },
+  sectionIconWrap: { width: 40, height: 40, borderRadius: 20, backgroundColor: 'rgba(217,74,140,0.15)', borderWidth: 1, borderColor: 'rgba(217,74,140,0.3)', alignItems: 'center', justifyContent: 'center' },
   sectionIcon: { fontSize: 18 },
   sectionTitle: { color: '#FDFBF7', fontSize: 15, fontWeight: '800' },
   sectionTime: { color: '#6B6478', fontSize: 12, marginTop: 1 },
-  statRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-    backgroundColor: 'rgba(255,255,255,0.04)',
-    borderRadius: 12,
-    padding: 12,
-  },
+  statRow: { flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: 'rgba(255,255,255,0.04)', borderRadius: 12, padding: 12 },
   statIcon: { fontSize: 16 },
   statLabel: { color: '#A299A8', fontSize: 13 },
   statNumber: { color: '#FDFBF7', fontWeight: '800' },
-  groupLabel: {
-    color: '#4A4356',
-    fontSize: 10,
-    fontWeight: '900',
-    letterSpacing: 1.5,
-    marginTop: 8,
-    marginBottom: 4,
-  },
-  filteredRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-    backgroundColor: 'rgba(255,255,255,0.03)',
-    borderRadius: 12,
-    padding: 12,
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.05)',
-    marginBottom: 6,
-  },
+  groupLabel: { color: '#4A4356', fontSize: 10, fontWeight: '900', letterSpacing: 1.5, marginTop: 8, marginBottom: 4 },
+  filteredRow: { flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: 'rgba(255,255,255,0.03)', borderRadius: 12, padding: 12, borderWidth: 1, borderColor: 'rgba(255,255,255,0.05)', marginBottom: 6 },
   filteredIcon: { fontSize: 16, width: 24, textAlign: 'center' },
   filteredContent: { flex: 1 },
   filteredReason: { color: '#C8C0CE', fontSize: 13, fontWeight: '600' },
-  filteredOwner: {
-    color: '#4A4356',
-    fontSize: 11,
-    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
-    marginTop: 2,
-  },
-  reasonBadge: {
-    borderRadius: 6,
-    paddingHorizontal: 7,
-    paddingVertical: 3,
-    backgroundColor: 'rgba(255,255,255,0.06)',
-  },
+  filteredOwner: { color: '#4A4356', fontSize: 11, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', marginTop: 2 },
+  reasonBadge: { borderRadius: 6, paddingHorizontal: 7, paddingVertical: 3, backgroundColor: 'rgba(255,255,255,0.06)' },
   badge_self: { backgroundColor: 'rgba(168,85,247,0.15)' },
   badge_matched: { backgroundColor: 'rgba(74,222,128,0.12)' },
   badge_gender_mismatch: { backgroundColor: 'rgba(251,191,36,0.12)' },
   badge_blocked_hidden: { backgroundColor: 'rgba(248,113,113,0.12)' },
   badge_fetch_failed: { backgroundColor: 'rgba(248,113,113,0.12)' },
   reasonBadgeText: { color: '#888', fontSize: 10, fontWeight: '700' },
-  passedRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    backgroundColor: 'rgba(74,222,128,0.06)',
-    borderRadius: 12,
-    padding: 12,
-    borderWidth: 1,
-    borderColor: 'rgba(74,222,128,0.2)',
-    marginBottom: 6,
-  },
-  passedLeft: { flexDirection: 'row', alignItems: 'center', gap: 10, flex: 1 },
-  passedIcon: { color: '#4ade80', fontSize: 14 },
+  passedRow: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', backgroundColor: 'rgba(74,222,128,0.06)', borderRadius: 12, padding: 12, borderWidth: 1, borderColor: 'rgba(74,222,128,0.2)', marginBottom: 6 },
+  passedLeft: { flexDirection: 'row', alignItems: 'flex-start', gap: 10, flex: 1 },
+  passedIcon: { color: '#4ade80', fontSize: 14, marginTop: 2 },
   passedName: { color: '#FDFBF7', fontSize: 14, fontWeight: '700', marginBottom: 4 },
   passedLinks: { flexDirection: 'row', gap: 8, flexWrap: 'wrap' },
-  linkBtn: {
-    borderRadius: 6,
-    borderWidth: 1,
-    borderColor: 'rgba(74,222,128,0.35)',
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-    backgroundColor: 'rgba(74,222,128,0.08)',
-  },
+  a2aSummaryText: { color: '#6B6478', fontSize: 11, marginTop: 6, lineHeight: 16 },
+  linkBtn: { borderRadius: 6, borderWidth: 1, borderColor: 'rgba(74,222,128,0.35)', paddingHorizontal: 8, paddingVertical: 3, backgroundColor: 'rgba(74,222,128,0.08)' },
   linkBtnText: { color: '#4ade80', fontSize: 10, fontWeight: '700' },
-  scorePill: {
-    borderRadius: 10,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    backgroundColor: 'rgba(74,222,128,0.12)',
-    borderWidth: 1,
-    borderColor: 'rgba(74,222,128,0.3)',
-    alignItems: 'center',
-  },
+  scorePill: { borderRadius: 10, paddingHorizontal: 10, paddingVertical: 6, backgroundColor: 'rgba(74,222,128,0.12)', borderWidth: 1, borderColor: 'rgba(74,222,128,0.3)', alignItems: 'center' },
   scoreText: { color: '#4ade80', fontSize: 13, fontWeight: '900' },
-  summaryBox: {
-    borderRadius: 14,
-    padding: 14,
-    backgroundColor: 'rgba(217,74,140,0.07)',
-    borderWidth: 1,
-    borderColor: 'rgba(217,74,140,0.2)',
-    marginTop: 8,
-  },
+  summaryBox: { borderRadius: 14, padding: 14, backgroundColor: 'rgba(217,74,140,0.07)', borderWidth: 1, borderColor: 'rgba(217,74,140,0.2)', marginTop: 8 },
   summaryText: { color: '#A299A8', fontSize: 13, lineHeight: 20 },
   summaryBold: { color: '#FDFBF7', fontWeight: '800' },
 });
