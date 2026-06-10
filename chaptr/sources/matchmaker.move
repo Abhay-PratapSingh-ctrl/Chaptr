@@ -1,6 +1,5 @@
 module chaptr::matchmaker {
     use std::string::String;
-    // IMPORT THE DIGITAL TWIN
     use chaptr::agent::DigitalTwin;
 
     // ─── Errors ───────────────────────────────────────────────────────────────
@@ -14,22 +13,27 @@ module chaptr::matchmaker {
     // ─── Objects ──────────────────────────────────────────────────────────────
 
     /// The Proposal acts as an Escrow. User A's agent is locked inside here.
+    /// Once proposed, the DigitalTwin leaves User A's wallet — they cannot
+    /// scout, run A2A, or propose to anyone else until this resolves.
     public struct MatchProposal has key, store {
         id: UID,
         from: address,
         to: address,
-        agent_a: DigitalTwin,    // <-- WRAPPED: User A's Agent is held in escrow
+        agent_a: DigitalTwin,    // WRAPPED: User A's Twin held in escrow
         similarity_score: u8,
         message: String,
     }
 
-    /// The active date. BOTH agents are locked inside this shared object.
+    /// The active match. BOTH twins are locked inside this shared object.
+    /// Neither participant can propose or run A2A while this exists —
+    /// the chain enforces exclusivity because their DigitalTwin objects
+    /// are physically not in their wallets.
     public struct Match has key, store {
         id: UID,
         participant_a: address,
         participant_b: address,
-        agent_a: DigitalTwin,    // <-- WRAPPED: User A's Agent
-        agent_b: DigitalTwin,    // <-- WRAPPED: User B's Agent
+        agent_a: DigitalTwin,    // WRAPPED: User A's Twin
+        agent_b: DigitalTwin,    // WRAPPED: User B's Twin
         score: u8,
         matched_at: u64,
     }
@@ -55,15 +59,16 @@ module chaptr::matchmaker {
         ended_by: address,
     }
 
-    // ─── Functions ────────────────────────────────────────────────────────────
+    // ─── Entry Functions ──────────────────────────────────────────────────────
 
-    /// User A proposes. They must pass their actual DigitalTwin object (by value) to lock it.
+    /// User A proposes. They pass their DigitalTwin by value — it leaves
+    /// their wallet and is locked in escrow until accepted, rejected, or withdrawn.
     public entry fun propose_match(
-        agent_a: DigitalTwin, // <-- Takes ownership of the agent!
+        agent_a: DigitalTwin,
         to: address,
         similarity_score: u8,
         message: String,
-        ctx: &mut TxContext
+        ctx: &mut TxContext,
     ) {
         let sender = ctx.sender();
         assert!(similarity_score >= MIN_SCORE, EScoreTooLow);
@@ -72,7 +77,7 @@ module chaptr::matchmaker {
             id: object::new(ctx),
             from: sender,
             to,
-            agent_a, // Escrow the agent
+            agent_a,
             similarity_score,
             message,
         };
@@ -84,20 +89,19 @@ module chaptr::matchmaker {
             score: similarity_score,
         });
 
-        // The proposal is shared so User B can accept/reject, and User A can withdraw
         sui::transfer::share_object(proposal);
     }
 
-    /// User B accepts. They must pass their DigitalTwin to complete the lockdown.
+    /// User B accepts. They pass their DigitalTwin — both twins are now
+    /// locked inside the Match object. Neither can be used elsewhere.
     public entry fun accept_proposal(
         proposal: MatchProposal,
-        agent_b: DigitalTwin, // <-- User B brings their agent to be locked
-        ctx: &mut TxContext
+        agent_b: DigitalTwin,
+        ctx: &mut TxContext,
     ) {
         let sender = ctx.sender();
         assert!(proposal.to == sender, ENotProposalTarget);
 
-        // Unpack the proposal to get User A's locked agent
         let MatchProposal { id, from, to, agent_a, similarity_score, message: _ } = proposal;
         object::delete(id);
 
@@ -105,8 +109,8 @@ module chaptr::matchmaker {
             id: object::new(ctx),
             participant_a: from,
             participant_b: to,
-            agent_a, // Lock A
-            agent_b, // Lock B
+            agent_a,
+            agent_b,
             score: similarity_score,
             matched_at: ctx.epoch(),
         };
@@ -118,48 +122,46 @@ module chaptr::matchmaker {
             score: similarity_score,
         });
 
-        // The Match is shared so either party can choose to end it later
         sui::transfer::share_object(new_match);
     }
 
-    /// User B rejects. The proposal is destroyed and User A's agent is returned.
+    /// User B rejects. Proposal is destroyed, User A's twin is returned to their wallet.
     public entry fun reject_proposal(
         proposal: MatchProposal,
-        ctx: &mut TxContext
+        ctx: &mut TxContext,
     ) {
         assert!(proposal.to == ctx.sender(), ENotProposalTarget);
-        
+
         let MatchProposal { id, from, to: _, agent_a, similarity_score: _, message: _ } = proposal;
         object::delete(id);
-        
-        // Return the escrowed agent back to User A's wallet
+
         sui::transfer::public_transfer(agent_a, from);
     }
 
-    /// User A withdraws their proposal. Their agent is returned.
+    /// User A withdraws their proposal. Their twin is returned to their wallet.
     public entry fun withdraw_proposal(
         proposal: MatchProposal,
-        ctx: &mut TxContext
+        ctx: &mut TxContext,
     ) {
         let sender = ctx.sender();
         assert!(proposal.from == sender, ENotOwner);
 
         let MatchProposal { id, from, to: _, agent_a, similarity_score: _, message: _ } = proposal;
         object::delete(id);
-        
-        // Return the escrowed agent back to User A's wallet
+
         sui::transfer::public_transfer(agent_a, from);
     }
 
-    /// Either user can end the date. The match is destroyed and BOTH agents are returned.
+    /// Either participant ends the match. Both twins are returned to their
+    /// respective wallets — they are now free to scout and be proposed to again.
     public entry fun end_match(
         active_match: Match,
-        ctx: &mut TxContext
+        ctx: &mut TxContext,
     ) {
         let sender = ctx.sender();
         assert!(
-            active_match.participant_a == sender || active_match.participant_b == sender, 
-            ENotParticipant
+            active_match.participant_a == sender || active_match.participant_b == sender,
+            ENotParticipant,
         );
 
         sui::event::emit(MatchEnded {
@@ -167,11 +169,17 @@ module chaptr::matchmaker {
             ended_by: sender,
         });
 
-        // Unpack the match
-        let Match { id, participant_a, participant_b, agent_a, agent_b, score: _, matched_at: _ } = active_match;
+        let Match {
+            id,
+            participant_a,
+            participant_b,
+            agent_a,
+            agent_b,
+            score: _,
+            matched_at: _,
+        } = active_match;
         object::delete(id);
 
-        // Unwrap and return both agents to their rightful owners so they can date again
         sui::transfer::public_transfer(agent_a, participant_a);
         sui::transfer::public_transfer(agent_b, participant_b);
     }
