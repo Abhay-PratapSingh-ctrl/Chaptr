@@ -72,21 +72,41 @@ const lookupExistingTwin = async (
     const fields = (obj.data?.content as any)?.fields;
     const raw: any[] = fields?.entries ?? [];
 
-    const match = raw.find((entry) => {
+    // Find ALL pool entries for this address (there may be duplicates)
+    const myEntries = raw.filter((entry) => {
       const f = entry.fields ?? entry;
       const owner = toPlainString(f.owner);
       return owner.toLowerCase() === userAddress.toLowerCase();
     });
 
-    if (!match) return null;
+    if (myEntries.length === 0) return null;
 
-    const f = match.fields ?? match;
-    const twinId = toPlainString(f.twin_id);
-    const scoutRef = toPlainString(f.scout_ref);
+    // Check each entry — the Twin might be consumed (wrapped in Match/Proposal).
+    // Return the FIRST entry whose Twin object still exists on-chain.
+    for (const entry of myEntries) {
+      const f = entry.fields ?? entry;
+      const twinId = toPlainString(f.twin_id);
+      const scoutRef = toPlainString(f.scout_ref);
 
-    if (!twinId || !scoutRef) return null;
+      if (!twinId || !scoutRef) continue;
 
-    return { twinId, scoutRef };
+      try {
+        const twinObj = await suiClient.getObject({ id: twinId, options: { showType: true } });
+        if (twinObj.error || !twinObj.data) {
+          console.warn(`[ConnectScreen] Twin ${twinId.slice(0, 12)}… is consumed/wrapped — skipping`);
+          continue;
+        }
+        // Twin exists and is accessible
+        return { twinId, scoutRef };
+      } catch {
+        console.warn(`[ConnectScreen] Failed to verify Twin ${twinId.slice(0, 12)}… — skipping`);
+        continue;
+      }
+    }
+
+    // All pool entries have consumed Twins — fall through to onboarding
+    console.warn('[ConnectScreen] All pool entry Twins are consumed — user needs to re-mint');
+    return null;
   } catch (err) {
     console.warn('[ConnectScreen] Twin Pool lookup failed:', err);
     return null;

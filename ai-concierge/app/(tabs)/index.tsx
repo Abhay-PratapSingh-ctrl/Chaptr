@@ -42,7 +42,7 @@ import {
   loadLocalScoutCapsule,
   type ScoutCapsule,
 } from '@/utils/twinMemory';
-import { syncHumanMatchesFromSui, processAutoAccepts } from '@/utils/matchSync';
+import { syncHumanMatchesFromSui, processAutoAccepts, getMatchedOwners } from '@/utils/matchSync';
 
 const AGGREGATOR = 'https://aggregator.walrus-testnet.walrus.space';
 const PUBLISHER = 'https://publisher.walrus-testnet.walrus.space';
@@ -850,19 +850,35 @@ export default function MorningBriefingScreen() {
       const blockedKeySet = new Set(blockedKeys.map((key) => key.toLowerCase()));
       const hiddenProfileIdSet = new Set(hiddenProfileIds.map((id) => id.toLowerCase()));
 
-      // Build active match owners set for visibility filtering
-      const chainMatches = myOwner
-        ? await syncHumanMatchesFromSui(myOwner).catch(() => [])
-        : [];
-      const localMatchesRaw = await AsyncStorage.getItem(HUMAN_MATCHES_KEY);
-      const localMatches: HumanMatch[] = (() => {
-        try {
-          const parsed = JSON.parse(localMatchesRaw ?? '[]');
-          return Array.isArray(parsed) ? parsed : [];
-        } catch { return []; }
-      })();
-      const allKnownMatches = chainMatches.length > 0 ? chainMatches : localMatches;
-      const activeMatchedOwners = new Set(allKnownMatches.map((m) => m.participantOwner.toLowerCase()));
+      // Build active match owners set from GLOBAL on-chain events.
+      // getMatchedOwners() returns ALL owners currently in ANY active match,
+      // not just the current user's partners. This prevents proposing to
+      // candidates who are matched with someone else (e.g. Ethan ↔ Mahek).
+      const activeMatchedOwners = await getMatchedOwners().catch((err) => {
+        console.warn('[pool] getMatchedOwners failed, falling back to local:', err);
+        // Fallback: use local matches (only covers current user's partners)
+        const localFallback = async () => {
+          const chainMatches = myOwner
+            ? await syncHumanMatchesFromSui(myOwner).catch(() => [])
+            : [];
+          const localMatchesRaw = await AsyncStorage.getItem(HUMAN_MATCHES_KEY);
+          const localMatches: HumanMatch[] = (() => {
+            try {
+              const parsed = JSON.parse(localMatchesRaw ?? '[]');
+              return Array.isArray(parsed) ? parsed : [];
+            } catch { return []; }
+          })();
+          const allKnownMatches = chainMatches.length > 0 ? chainMatches : localMatches;
+          const owners = new Set<string>();
+          for (const m of allKnownMatches) {
+            if (m.participantOwner) owners.add(m.participantOwner.toLowerCase());
+          }
+          // Also add myOwner if I have matches (so self-check works)
+          if (myOwner && allKnownMatches.length > 0) owners.add(myOwner.toLowerCase());
+          return owners;
+        };
+        return localFallback();
+      });
 
       if (entries.length === 0) {
         setProfiles([]);
@@ -896,8 +912,12 @@ export default function MorningBriefingScreen() {
 
       // Read mandate once outside the loop for efficiency
       const mandateIdStored = await AsyncStorage.getItem('chaptr:mandate-id');
-      const isInActiveMatch = activeMatchedOwners.size > 0 &&
-        [...activeMatchedOwners].some(o => sameAddress(o, myOwner ?? ''));
+      // Self-check: am I already in an active match? If so, skip A2A + propose.
+      // getMatchedOwners() includes BOTH sides of each match, so myOwner will
+      // be in the set if I'm currently matched with anyone.
+      const isInActiveMatch = Boolean(
+        myOwner && activeMatchedOwners.has(myOwner.toLowerCase()),
+      );
 
       let mandateFields: any = null;
       if (mandateIdStored && !isInActiveMatch) {
@@ -1177,9 +1197,50 @@ export default function MorningBriefingScreen() {
 
       let phaseJwt: string | undefined;
 
-      if (proposeActions.length > 0 && myOwner) {
+      // ── Pre-Phase-4: Auto-accept incoming proposals ──────────────────────
+      // MUST run BEFORE outbound proposals because both operations consume the
+      // DigitalTwin by value (Move's ownership model):
+      //   - accept_proposal(proposal, agent_b: DigitalTwin) → Twin locked in Match
+      //   - propose_match(agent_a: DigitalTwin, ...) → Twin locked in MatchProposal
+      //
+      // If Phase 4 proposes first, Twin is in escrow → auto-accept can't use it.
+      // By accepting first, we prioritize completing existing connections.
+      let twinConsumedByAccept = false;
+      const myTwinIdForAccept = await AsyncStorage.getItem('chaptr:my-twin-id');
+
+      if (myOwner && mandateFields?.may_propose === true) {
         try {
           phaseJwt = await getJwtForTransaction();
+          console.log('[Pre-Phase4] JWT obtained — running auto-accept before outbound proposals');
+
+          // Run auto-accept synchronously (not fire-and-forget) so we know
+          // whether the Twin was consumed before we try Phase 4.
+          await processAutoAccepts(myOwner, phaseJwt);
+
+          // Check if Twin is still available after auto-accept
+          if (myTwinIdForAccept) {
+            try {
+              const twinCheck = await suiClient.getObject({
+                id: myTwinIdForAccept,
+                options: { showType: true },
+              });
+              if (twinCheck.error || !twinCheck.data) {
+                twinConsumedByAccept = true;
+                console.log('[Pre-Phase4] Twin consumed by auto-accept — skipping outbound proposals');
+              }
+            } catch {
+              twinConsumedByAccept = true;
+            }
+          }
+        } catch (jwtErr) {
+          console.warn('[Pre-Phase4] JWT/auto-accept failed (non-blocking):', jwtErr);
+        }
+      }
+
+      // ── Phase 4: Outbound proposals (only if Twin still available) ─────────
+      if (!twinConsumedByAccept && proposeActions.length > 0 && myOwner) {
+        try {
+          if (!phaseJwt) phaseJwt = await getJwtForTransaction();
           for (const action of proposeActions) {
             // ── Active-match guard ─────────────────────────────────────────
             // Skip if the target is already in a match — prevents proposing
@@ -1264,13 +1325,9 @@ export default function MorningBriefingScreen() {
     setActiveProposal(synced.proposal);
     setHumanMatches(synced.matches);
 
-    // ── Agentic Web: auto-accept incoming proposals that meet mandate threshold
-    // Fire-and-forget — has its own JWT flow and guard keys internally.
-    if (myOwner) {
-      processAutoAccepts(myOwner, existingJwt).catch((err) =>
-        console.warn('[Auto-Accept] processAutoAccepts failed (non-blocking):', err),
-      );
-    }
+    // NOTE: processAutoAccepts now runs in loadPoolProfiles BEFORE Phase 4.
+    // It no longer runs here — this prevents double-execution and ensures
+    // incoming accepts are prioritized over outbound proposals.
   }, []);
 
   useFocusEffect(

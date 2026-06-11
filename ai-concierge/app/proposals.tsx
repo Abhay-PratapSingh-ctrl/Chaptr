@@ -15,23 +15,20 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { LinearGradient } from 'expo-linear-gradient';
 import { router, useFocusEffect } from 'expo-router';
 import * as WebBrowser from 'expo-web-browser';
-import * as AuthSession from 'expo-auth-session';
-import { getZkLoginSignature,generateNonce  } from '@mysten/sui/zklogin';
-import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
-import { readBlockedProfileKeys, writeBlockEntry } from '@/utils/safetyService';
 import {
   buildAcceptProposalTx,
   buildRejectProposalTx,
 } from '@/utils/suiTransactions';
 import {
-  fetchZkProof,
-  loadZkLoginParams,
-  setupZkLoginParams,
+  getJwtForTransaction,
+  executeZkLoginTransaction,
 } from '@/utils/zkLoginService';
+import { processAutoAccepts } from '@/utils/matchSync';
+import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
+import { readBlockedProfileKeys, writeBlockEntry } from '@/utils/safetyService';
 
 WebBrowser.maybeCompleteAuthSession();
 
-const GOOGLE_CLIENT_ID = process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID || '';
 const PACKAGE_ID = process.env.EXPO_PUBLIC_PACKAGE_ID || '';
 const TWIN_POOL_ID = process.env.EXPO_PUBLIC_TWIN_POOL_ID || '';
 const AGGREGATOR = 'https://aggregator.walrus-testnet.walrus.space';
@@ -44,10 +41,6 @@ const suiClient = new SuiJsonRpcClient({
   url: getJsonRpcFullnodeUrl('testnet'),
   network: 'testnet',
 });
-
-const discovery = {
-  authorizationEndpoint: 'https://accounts.google.com/o/oauth2/v2/auth',
-};
 
 interface PoolEntry {
   twin_id: string;
@@ -78,6 +71,13 @@ interface IncomingProposal {
   proposerAge: number;
   proposerLocation: string;
   proposerPhotoUrl: string;
+}
+interface OutgoingProposal {
+  proposalId: string;
+  to: string;
+  score: number;
+  toName: string;
+  toPhotoUrl: string;
 }
 
 const blobUrl = (blobId: string) =>
@@ -189,77 +189,16 @@ const queryProposalEvents = async () => {
   });
 };
 
-const getJwtForProposalAction = async () => {
-  // Load existing zk params — DO NOT call setupZkLoginParams() here
-  // setupZkLoginParams clears keys first, breaking the ephemeral key match
-  let params;
-  try {
-    params = await loadZkLoginParams();
-  } catch {
-    // Only setup fresh if truly missing
-    params = await setupZkLoginParams();
-  }
-
-  const nonce  = generateNonce(
-    params.ephemeralKeyPair.getPublicKey(),
-    params.maxEpoch,
-    params.randomness,
-  );
-
-  const redirectUri = AuthSession.makeRedirectUri();
-
-  const request = new AuthSession.AuthRequest({
-    clientId: GOOGLE_CLIENT_ID,
-    responseType: AuthSession.ResponseType.IdToken,
-    scopes: ['openid', 'email', 'profile'],
-    redirectUri,
-    extraParams: { nonce, prompt: 'select_account' },
-    usePKCE: false,
-  });
-
-  const result = await request.promptAsync(discovery);
-  if (result.type !== 'success') throw new Error('Google sign-in was cancelled');
-
-  const idToken = result.params.id_token;
-  if (!idToken) throw new Error('No id_token returned');
-
-  return idToken;
-};
-
+// ── executeWithZkLogin ────────────────────────────────────────────────────────
+// Thin wrapper that delegates to the shared zkLoginService helpers.
+// getJwtForTransaction + executeZkLoginTransaction now live in zkLoginService
+// so matchSync (processAutoAccepts) can import them without a circular dep.
 const executeWithZkLogin = async (tx: any) => {
-  const jwt = await getJwtForProposalAction();
-  const { ephemeralKeyPair, maxEpoch, randomness } = await loadZkLoginParams();
-  const { zkProof, addressSeed, userAddress } = await fetchZkProof(
-    jwt,
-    ephemeralKeyPair,
-    maxEpoch,
-    randomness,
-  );
+  const myOwner = await AsyncStorage.getItem('chaptr:my-owner');
+  if (!myOwner) throw new Error("No local owner — create your Twin first.");
 
-  const expectedOwner = await AsyncStorage.getItem('chaptr:my-owner');
-
-  if (expectedOwner && userAddress.toLowerCase() !== expectedOwner.toLowerCase()) {
-    throw new Error("Selected Google account does not match this browser's Chaptr identity.");
-  }
-
-  tx.setSender(userAddress);
-
-  const { bytes, signature: userSignature } = await tx.sign({
-    client: suiClient,
-    signer: ephemeralKeyPair,
-  });
-
-  const zkSignature = getZkLoginSignature({
-    inputs: { ...(zkProof as any), addressSeed },
-    maxEpoch,
-    userSignature,
-  });
-
-  return suiClient.executeTransactionBlock({
-    transactionBlock: bytes,
-    signature: zkSignature,
-    options: { showEffects: true, showEvents: true, showObjectChanges: true },
-  });
+  const jwt = await getJwtForTransaction();
+  return executeZkLoginTransaction(tx, myOwner, jwt);
 };
 
 const getInitial = (name: string) => (name ?? '?').charAt(0).toUpperCase();
@@ -272,6 +211,8 @@ export default function ProposalsScreen() {
   const [isLoading, setIsLoading] = useState(true);
   const [actionId, setActionId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [outgoingProposals, setOutgoingProposals] = useState<OutgoingProposal[]>([]);
+  const [withdrawId, setWithdrawId] = useState<string | null>(null);
 
   const loadProposals = useCallback(async () => {
     setIsLoading(true);
@@ -286,21 +227,28 @@ export default function ProposalsScreen() {
         return;
       }
 
-      const [eventsResult, poolEntries, hiddenProposalIds, blockedProfileKeys, existingMatchesRaw] =
-  await Promise.all([
-    queryProposalEvents(),
-    fetchPoolEntries(),
-    readStringArray(HIDDEN_PROPOSALS_KEY),
-    readBlockedProfileKeys(),
-    AsyncStorage.getItem(HUMAN_MATCHES_KEY),
-  ]);
+      // ── Agentic Web: auto-accept any incoming proposals that meet mandate ──
+      // Fire-and-forget — runs alongside the manual proposal load.
+      // Has its own JWT flow and guard keys so it never double-fires.
+      processAutoAccepts(myOwner).catch((err) =>
+        console.warn('[Auto-Accept] processAutoAccepts failed (non-blocking):', err),
+      );
 
-const existingMatches = existingMatchesRaw ? JSON.parse(existingMatchesRaw) : [];
-const alreadyMatchedOwners = new Set(
-  (Array.isArray(existingMatches) ? existingMatches : [])
-    .map((m: any) => (m.participantOwner ?? '').toLowerCase())
-    .filter(Boolean)
-);
+      const [eventsResult, poolEntries, hiddenProposalIds, blockedProfileKeys, existingMatchesRaw] =
+        await Promise.all([
+          queryProposalEvents(),
+          fetchPoolEntries(),
+          readStringArray(HIDDEN_PROPOSALS_KEY),
+          readBlockedProfileKeys(),
+          AsyncStorage.getItem(HUMAN_MATCHES_KEY),
+        ]);
+
+      const existingMatches = existingMatchesRaw ? JSON.parse(existingMatchesRaw) : [];
+      const alreadyMatchedOwners = new Set(
+        (Array.isArray(existingMatches) ? existingMatches : [])
+          .map((m: any) => (m.participantOwner ?? '').toLowerCase())
+          .filter(Boolean)
+      );
 
       const blockedKeySet = new Set(blockedProfileKeys.map((key) => key.toLowerCase()));
 
@@ -323,7 +271,7 @@ const alreadyMatchedOwners = new Set(
         .filter((event) => !hiddenProposalIds.includes(event.proposalId))
         .filter((event) => !blockedKeySet.has(event.from.toLowerCase()))
         .filter((event) => !alreadyMatchedOwners.has(event.from.toLowerCase()))
-        .filter((event) => !sameAddress(event.from, myOwner)); // never show your own proposals back
+        .filter((event) => !sameAddress(event.from, myOwner));
 
       const uniqueByProposal = new Map<string, typeof incomingEvents[number]>();
       incomingEvents.forEach((event) => uniqueByProposal.set(event.proposalId, event));
@@ -373,10 +321,69 @@ const alreadyMatchedOwners = new Set(
     }
   }, []);
 
+  const loadOutgoingProposals = useCallback(async () => {
+    const myOwner = await AsyncStorage.getItem('chaptr:my-owner');
+    if (!myOwner || !PACKAGE_ID) return;
+
+    try {
+      const eventsResult = await suiClient.queryEvents({
+        query: { MoveEventType: `${PACKAGE_ID}::matchmaker::ProposalSent` },
+        limit: 50,
+        order: 'descending',
+      });
+
+      const outbound = (eventsResult.data ?? [])
+        .map((e: any) => e.parsedJson ?? {})
+        .filter((p: any) => p.from?.toLowerCase() === myOwner.toLowerCase())
+        .filter((p: any) => p.proposal_id);
+
+      // Check which ones still exist on-chain
+      const checked = await Promise.all(
+        outbound.map(async (p: any) => {
+          try {
+            const obj = await suiClient.getObject({
+              id: p.proposal_id,
+              options: { showContent: false },
+            });
+            if (!obj.data) return null;
+          } catch { return null; }
+
+          // Enrich with pool data
+          const poolEntries = await fetchPoolEntries().catch(() => []);
+          const entry = poolEntries.find((e) =>
+            e.owner.toLowerCase() === p.to?.toLowerCase()
+          );
+          const scout = entry?.scout_ref
+            ? await fetchScoutProfile(entry.scout_ref)
+            : null;
+
+          return {
+            proposalId: toPlainString(p.proposal_id),
+            to: toPlainString(p.to),
+            score: Number(p.score) || 0,
+            toName: scout?.displayName || `${p.to?.slice(0, 6)}...${p.to?.slice(-4)}`,
+            toPhotoUrl: scout?.previewPhotoBlobId
+              ? blobUrl(scout.previewPhotoBlobId)
+              : fallbackPhotoUrl(p.to),
+          } as OutgoingProposal;
+        })
+      );
+
+      // Deduplicate by proposalId, keep only live ones
+      const live = checked.filter(Boolean) as OutgoingProposal[];
+      const unique = new Map<string, OutgoingProposal>();
+      live.forEach(p => unique.set(p.proposalId, p));
+      setOutgoingProposals(Array.from(unique.values()));
+    } catch (err) {
+      console.warn('[Outgoing] Failed to load:', err);
+    }
+  }, []);
+
   useFocusEffect(
     useCallback(() => {
       loadProposals().catch(console.warn);
-    }, [loadProposals]),
+      loadOutgoingProposals().catch(console.warn);
+    }, [loadProposals, loadOutgoingProposals]),
   );
 
   const handleTalkToTwin = (proposal: IncomingProposal) => {
@@ -515,6 +522,30 @@ const alreadyMatchedOwners = new Set(
     }
   };
 
+  const handleWithdraw = async (proposal: OutgoingProposal) => {
+    try {
+      setWithdrawId(proposal.proposalId);
+      const { buildWithdrawProposalTx } = await import('@/utils/suiTransactions');
+      const tx = buildWithdrawProposalTx(proposal.proposalId);
+      const result = await executeWithZkLogin(tx);
+
+      // Clear the auto-proposed guard so this person can be proposed to again
+      await AsyncStorage.removeItem(
+        `chaptr:auto-proposed:${proposal.to.toLowerCase()}`
+      );
+
+      setOutgoingProposals(prev =>
+        prev.filter(p => p.proposalId !== proposal.proposalId)
+      );
+
+      Alert.alert('Withdrawn', `Your Twin is free again.\nTx: ${result.digest.slice(0, 18)}...`);
+    } catch (err: any) {
+      Alert.alert('Withdraw failed', err.message ?? 'Could not withdraw.');
+    } finally {
+      setWithdrawId(null);
+    }
+  };
+
   if (isLoading) {
     return (
       <SafeAreaView style={styles.root}>
@@ -545,6 +576,46 @@ const alreadyMatchedOwners = new Set(
         <Text style={styles.pageSubtitle}>
           Talk to their Twin before accepting. Human chat opens only after you accept.
         </Text>
+
+        {outgoingProposals.length > 0 && (
+          <>
+            <Text style={styles.sectionTitle}>Outgoing Proposals</Text>
+            <Text style={styles.sectionSubtitle}>
+              Your Twin is in Focus Mode. Withdraw to free your Twin.
+            </Text>
+            {outgoingProposals.map(proposal => {
+              const isWorking = withdrawId === proposal.proposalId;
+              const color = scoreColor(proposal.score);
+              return (
+                <View key={proposal.proposalId} style={styles.outgoingCard}>
+                  <View style={styles.outgoingLeft}>
+                    <Image source={{ uri: proposal.toPhotoUrl }} style={styles.outgoingAvatar} />
+                    <View>
+                      <Text style={styles.outgoingName}>{proposal.toName}</Text>
+                      <Text style={styles.outgoingMeta}>
+                        Score: <Text style={{ color }}>{proposal.score}%</Text>
+                      </Text>
+                      <Text style={styles.outgoingRef}>
+                        {proposal.proposalId.slice(0, 14)}...
+                      </Text>
+                    </View>
+                  </View>
+                  <TouchableOpacity
+                    style={[styles.withdrawButton, isWorking && { opacity: 0.5 }]}
+                    onPress={() => handleWithdraw(proposal)}
+                    disabled={isWorking}
+                    activeOpacity={0.8}
+                  >
+                    <Text style={styles.withdrawText}>
+                      {isWorking ? 'Withdrawing...' : 'Withdraw'}
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+              );
+            })}
+            <View style={styles.sectionDivider} />
+          </>
+        )}
 
         {error ? <Text style={styles.errorText}>{error}</Text> : null}
 
@@ -872,4 +943,36 @@ const styles = StyleSheet.create({
   },
   acceptGradient: { flex: 1, justifyContent: 'center', alignItems: 'center' },
   acceptText: { color: '#FFF', fontSize: 15, fontWeight: '900' },
+  sectionTitle: { color: '#FDFBF7', fontSize: 20, fontWeight: '900', marginBottom: 4 },
+  sectionSubtitle: { color: '#A299A8', fontSize: 13, lineHeight: 18, marginBottom: 14 },
+  sectionDivider: { height: 1, backgroundColor: 'rgba(255,255,255,0.06)', marginVertical: 20 },
+  outgoingCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: 'rgba(74,222,128,0.25)',
+    backgroundColor: 'rgba(74,222,128,0.05)',
+    padding: 14,
+    marginBottom: 10,
+  },
+  outgoingLeft: { flexDirection: 'row', alignItems: 'center', gap: 12, flex: 1 },
+  outgoingAvatar: { width: 44, height: 44, borderRadius: 22, backgroundColor: '#2A2432' },
+  outgoingName: { color: '#FDFBF7', fontSize: 15, fontWeight: '800' },
+  outgoingMeta: { color: '#A299A8', fontSize: 12, marginTop: 2 },
+  outgoingRef: {
+    color: '#4A4356', fontSize: 10,
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+    marginTop: 2,
+  },
+  withdrawButton: {
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(248,113,113,0.45)',
+    backgroundColor: 'rgba(248,113,113,0.08)',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+  },
+  withdrawText: { color: '#fca5a5', fontSize: 13, fontWeight: '800' },
 });

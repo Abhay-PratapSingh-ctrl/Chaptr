@@ -157,6 +157,42 @@ const queryEndedMatchIds = async (): Promise<Set<string>> => {
 };
 
 /**
+ * getMatchedOwners
+ *
+ * Returns the set of ALL owner addresses that are currently in an active match,
+ * regardless of which side they're on. This is a global view — not scoped to a
+ * single user — so the Morning Briefing can filter out candidates who are
+ * matched with *anyone*, not just the current user.
+ *
+ * Used to prevent:
+ * - Proposing to someone already matched (candidate filter)
+ * - Running A2A when the current user is already matched (self-check)
+ */
+export const getMatchedOwners = async (): Promise<Set<string>> => {
+  const [matchFormedEvents, endedIds] = await Promise.all([
+    queryMatchFormedEvents(),
+    queryEndedMatchIds(),
+  ]);
+
+  const matched = new Set<string>();
+
+  for (const event of matchFormedEvents) {
+    const parsed = (event.parsedJson as Record<string, any>) ?? {};
+    const matchId = toPlainString(parsed.match_id ?? parsed.matchId);
+
+    // Skip ended matches — those owners are available again
+    if (matchId && endedIds.has(matchId.toLowerCase())) continue;
+
+    const a = toPlainString(parsed.participant_a ?? parsed.owner_a ?? parsed.from);
+    const b = toPlainString(parsed.participant_b ?? parsed.owner_b ?? parsed.to);
+    if (a) matched.add(a.toLowerCase());
+    if (b) matched.add(b.toLowerCase());
+  }
+
+  return matched;
+};
+
+/**
  * Returns all PENDING proposals where myOwner is the target.
  */
 const queryPendingIncomingProposals = async (myOwner: string) => {
@@ -319,10 +355,13 @@ export const syncHumanMatchesFromSui = async (
  * Agentic Web target autonomy — closes the loop on the receiving side.
  *
  * How it works:
- * 1. Queries ProposalSent events targeting myOwner
- * 2. Fetches the user's on-chain Mandate to read may_propose + min_score_to_propose
- * 3. For each proposal whose score meets the threshold, fires accept_proposal
- * 4. Saves a guard key BEFORE firing so we never double-accept even on crash
+ * 1. Checks if the user is already in an active match (Twin locked → bail)
+ * 2. Queries ProposalSent events targeting myOwner
+ * 3. Filters out proposals from already-matched owners (stale proposals)
+ * 4. Deduplicates by proposer (handles double-propose edge case)
+ * 5. Verifies proposal object still EXISTS on-chain (skips deleted ones)
+ * 6. Fetches the user's on-chain Mandate to read may_propose + min_score_to_propose
+ * 7. Accepts the FIRST qualifying proposal, then stops (Twin is consumed)
  *
  * JWT sharing: accepts an optional existingJwt param. When Morning Briefing's
  * Phase 4 already obtained a JWT (for auto-propose), it passes it here so
@@ -336,10 +375,30 @@ export const processAutoAccepts = async (
   myOwner: string,
   existingJwt?: string,
 ): Promise<void> => {
-  const incomingProposals = await queryPendingIncomingProposals(myOwner);
-  if (incomingProposals.length === 0) return;
+  // ── Step 1: Global match check ─────────────────────────────────────────────
+  // getMatchedOwners() returns ALL owners currently in ANY active match.
+  // If I'm in the set, my Twin is locked inside a Match object and
+  // accept_proposal (which takes Twin by value) will always fail.
+  const matchedOwners = await getMatchedOwners().catch((err) => {
+    console.warn('[Auto-Accept] getMatchedOwners failed:', err);
+    return new Set<string>();
+  });
 
-  // Read mandate from chain — not from AsyncStorage
+  if (matchedOwners.has(myOwner.toLowerCase())) {
+    console.log('[Auto-Accept] Skipping — I am already in an active match (Twin locked)');
+    return;
+  }
+
+  // ── Step 2: Query incoming proposals ───────────────────────────────────────
+  const incomingProposals = await queryPendingIncomingProposals(myOwner);
+  if (incomingProposals.length === 0) {
+    console.log('[Auto-Accept] No incoming proposals found');
+    return;
+  }
+
+  console.log(`[Auto-Accept] Found ${incomingProposals.length} ProposalSent event(s) targeting me`);
+
+  // ── Step 3: Read mandate from chain ────────────────────────────────────────
   const mandateIdStored = await AsyncStorage.getItem('chaptr:mandate-id');
   let mandateFields: any = null;
 
@@ -357,7 +416,10 @@ export const processAutoAccepts = async (
   }
 
   // Opt-in gate
-  if (mandateFields?.may_propose !== true) return;
+  if (mandateFields?.may_propose !== true) {
+    console.log('[Auto-Accept] Mandate may_propose is not true — skipping');
+    return;
+  }
 
   const minScoreToAccept = Number(mandateFields?.min_score_to_propose ?? 80);
 
@@ -367,24 +429,99 @@ export const processAutoAccepts = async (
     return;
   }
 
-  // Filter to proposals that clear the score bar AND haven't been accepted yet
-  const actionable = await Promise.all(
-    incomingProposals
-      .filter((p) => p.compatibility_score >= minScoreToAccept)
-      .map(async (p) => {
-        const guardKey = `chaptr:auto-accepted:${p.id.toLowerCase()}`;
-        const alreadyDone = await AsyncStorage.getItem(guardKey);
-        return alreadyDone ? null : p;
-      }),
+  // Verify my Twin is still available (not wrapped inside a Match or Proposal)
+  try {
+    const twinObj = await suiClient.getObject({ id: myTwinId, options: { showType: true } });
+    if (twinObj.error || !twinObj.data) {
+      console.warn(`[Auto-Accept] My Twin ${myTwinId.slice(0, 12)}… is unavailable (consumed/wrapped). Cannot accept.`);
+      return;
+    }
+  } catch {
+    console.warn('[Auto-Accept] Failed to verify Twin status — skipping');
+    return;
+  }
+
+  // ── Step 4: Filter proposals ───────────────────────────────────────────────
+  // 4a. Score threshold
+  // 4b. Guard key (already processed in a prior session)
+  // 4c. Proposer not already matched (their proposal is stale/un-acceptable)
+  // 4d. Deduplicate by proposer (keep only one per proposer)
+  // 4e. Verify proposal object still exists on-chain (skip deleted ones)
+  const scorePassed = incomingProposals.filter((p) => {
+    if (p.compatibility_score < minScoreToAccept) {
+      console.log(`[Auto-Accept] Skipping ${p.id.slice(0, 12)}… — score ${p.compatibility_score} < ${minScoreToAccept}`);
+      return false;
+    }
+    return true;
+  });
+
+  const matchFiltered = scorePassed.filter((p) => {
+    if (matchedOwners.has(p.proposer.toLowerCase())) {
+      console.log(`[Auto-Accept] Skipping ${p.id.slice(0, 12)}… — proposer ${p.proposer.slice(0, 10)} already in a match`);
+      return false;
+    }
+    return true;
+  });
+
+  const guardFiltered = await Promise.all(
+    matchFiltered.map(async (p) => {
+      const guardKey = `chaptr:auto-accepted:${p.id.toLowerCase()}`;
+      const alreadyDone = await AsyncStorage.getItem(guardKey);
+      if (alreadyDone) {
+        console.log(`[Auto-Accept] Skipping ${p.id.slice(0, 12)}… — guard key exists (${alreadyDone})`);
+        return null;
+      }
+      return p;
+    }),
   );
 
-  const toProcess = actionable.filter(Boolean) as typeof incomingProposals;
-  if (toProcess.length === 0) return;
+  const afterGuard = guardFiltered.filter(Boolean) as typeof incomingProposals;
 
-  // ── JWT acquisition ───────────────────────────────────────────────────────
-  // If Phase 4 already got a JWT (for outbound proposals), reuse it here.
-  // This avoids a second Google popup and eliminates the browser popup blocker
-  // issue on web — one popup covers both propose and accept in one session.
+  // Deduplicate by proposer — if Abhay proposed twice, only accept one
+  const uniqueByProposer = new Map<string, typeof afterGuard[0]>();
+  for (const p of afterGuard) {
+    const key = p.proposer.toLowerCase();
+    if (!uniqueByProposer.has(key)) {
+      uniqueByProposer.set(key, p);
+    } else {
+      console.log(`[Auto-Accept] Dedup — skipping duplicate proposal ${p.id.slice(0, 12)}… from ${p.proposer.slice(0, 10)}`);
+    }
+  }
+
+  const candidates = Array.from(uniqueByProposer.values());
+
+  // Verify each proposal object still exists on-chain (skip deleted/consumed ones)
+  const liveProposals = await Promise.all(
+    candidates.map(async (p) => {
+      try {
+        const obj = await suiClient.getObject({ id: p.id, options: { showType: true } });
+        if (obj.error || !obj.data) {
+          console.log(`[Auto-Accept] Skipping ${p.id.slice(0, 12)}… — object no longer exists on-chain (deleted/consumed)`);
+          // Set guard key so we don't re-query this dead proposal every load
+          await AsyncStorage.setItem(
+            `chaptr:auto-accepted:${p.id.toLowerCase()}`,
+            `deleted:${new Date().toISOString()}`,
+          );
+          return null;
+        }
+        return p;
+      } catch {
+        console.log(`[Auto-Accept] Skipping ${p.id.slice(0, 12)}… — failed to verify on-chain status`);
+        return null;
+      }
+    }),
+  );
+
+  const toProcess = liveProposals.filter(Boolean) as typeof incomingProposals;
+
+  if (toProcess.length === 0) {
+    console.log('[Auto-Accept] No actionable proposals after filtering');
+    return;
+  }
+
+  console.log(`[Auto-Accept] ${toProcess.length} live proposal(s) to process`);
+
+  // ── Step 5: JWT acquisition ────────────────────────────────────────────────
   // Reuse the JWT from Phase 4 if available — avoids a second Google popup.
   // Falls back to getJwtForTransaction() if no JWT was passed in.
   let jwt: string;
@@ -395,20 +532,30 @@ export const processAutoAccepts = async (
     return;
   }
 
+  // ── Step 6: Accept ONE proposal, then stop ─────────────────────────────────
+  // accept_proposal takes DigitalTwin by value — after accepting one proposal,
+  // the Twin is locked inside the new Match object. Attempting a second accept
+  // would fail with "object not found" because the Twin is no longer in the wallet.
   for (const proposal of toProcess) {
-    // Write guard key BEFORE firing tx — if tx crashes, guard prevents retry loop
     const guardKey = `chaptr:auto-accepted:${proposal.id.toLowerCase()}`;
-    await AsyncStorage.setItem(guardKey, new Date().toISOString());
 
     try {
       const acceptTx = buildAcceptProposalTx(proposal.id, myTwinId);
       await executeZkLoginTransaction(acceptTx, myOwner, jwt);
-      console.log(`[Auto-Accept] Accepted proposal from ${proposal.proposer.slice(0, 8)}`);
-    } catch (txErr) {
-      console.warn(
-        `[Auto-Accept] Failed to accept proposal ${proposal.id}:`,
-        txErr,
-      );
+
+      // Guard key set AFTER success — allows retry on transient failures
+      await AsyncStorage.setItem(guardKey, `accepted:${new Date().toISOString()}`);
+      console.log(`[Auto-Accept] ✅ Accepted proposal from ${proposal.proposer.slice(0, 8)} — match formed!`);
+
+      // Stop here — Twin is now locked, no further accepts are possible
+      break;
+    } catch (txErr: any) {
+      const errMsg = txErr?.message ?? String(txErr);
+      console.warn(`[Auto-Accept] ❌ Failed to accept proposal ${proposal.id.slice(0, 18)}:`, errMsg);
+
+      // Mark as failed to prevent infinite retries on permanently broken proposals
+      // (e.g., proposal already rejected/withdrawn on-chain but events still exist)
+      await AsyncStorage.setItem(guardKey, `failed:${new Date().toISOString()}`);
     }
   }
 };
