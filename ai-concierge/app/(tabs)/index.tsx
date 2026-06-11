@@ -23,6 +23,7 @@ import {
   buildWithdrawProposalTx,
   buildRecordA2AResultTx,
   buildProposeMatchTx,
+  buildRecordAndProposePTB,
 } from '@/utils/suiTransactions';
 import {
   fetchZkProof,
@@ -475,7 +476,7 @@ const extractBlobId = (result: any): string | null =>
   result.newlyCreated?.blobObject?.blobId ?? result.alreadyCertified?.blobId ?? null;
 
 const uploadJsonToWalrus = async (payload: unknown): Promise<string> => {
-  const response = await fetch(`${PUBLISHER}/v1/blobs?epochs=10`, {
+  const response = await fetch(`${PUBLISHER}/v1/blobs?epochs=50`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
@@ -1180,23 +1181,49 @@ export default function MorningBriefingScreen() {
         try {
           phaseJwt = await getJwtForTransaction();
           for (const action of proposeActions) {
+            // ── Active-match guard ─────────────────────────────────────────
+            // Skip if the target is already in a match — prevents proposing
+            // to users like Mahek who are matched with someone else.
+            if (activeMatchedOwners.has(action.entryOwner.toLowerCase())) {
+              console.log('[PTB] Skipping — target already in match:', action.entryOwner.slice(0, 10));
+              continue;
+            }
+
             try {
-              const proposeTx = buildProposeMatchTx(
+              // PTB: record_a2a_result + propose_match in one tx = 1 Enoki proof
+              const ptb = buildRecordAndProposePTB(
+                action.mandateIdStored,
+                action.entryOwner,
+                action.transcriptRef,
+                action.reportRef,
+                action.score,
                 action.twinId,
                 action.entryOwner,
-                action.score,
                 `Your Twin scored ${action.score}% in an A2A conversation. No human was involved.`,
               );
-              await executeZkLoginTransaction(proposeTx, myOwner, phaseJwt);
-              // Save the guard key immediately after success so we never
-              // re-propose this candidate, even if the tab is closed mid-loop.
+              await executeZkLoginTransaction(ptb, myOwner, phaseJwt);
               await AsyncStorage.setItem(
                 `chaptr:auto-proposed:${action.entryOwner.toLowerCase()}`,
                 new Date().toISOString(),
               );
-              console.log('[A2A] Auto-proposed to', action.entryOwner, 'score:', action.score);
+              console.log('[PTB] Recorded + proposed to', action.entryOwner.slice(0, 10), 'score:', action.score);
             } catch (actionErr) {
-              console.warn('[A2A] Propose failed (non-blocking):', actionErr);
+              console.warn('[PTB] Batch failed, falling back to record-only:', actionErr);
+              // Fallback: if PTB fails (e.g. Twin already in escrow),
+              // fire record_a2a_result alone so A2A is still anchored on-chain.
+              try {
+                const recordTx = buildRecordA2AResultTx(
+                  action.mandateIdStored,
+                  action.entryOwner,
+                  action.transcriptRef,
+                  action.reportRef,
+                  action.score,
+                );
+                await executeZkLoginTransaction(recordTx, myOwner, phaseJwt);
+                console.log('[PTB] Fallback record-only succeeded for', action.entryOwner.slice(0, 10));
+              } catch (recordErr) {
+                console.warn('[PTB] Fallback record also failed (non-blocking):', recordErr);
+              }
             }
           }
         } catch (jwtErr) {

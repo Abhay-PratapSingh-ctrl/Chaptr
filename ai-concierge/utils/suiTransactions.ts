@@ -187,3 +187,40 @@ export const buildRecordA2AResultTx = (
 
   return tx;
 };
+
+export const buildRecordAndProposePTB = (
+  mandateId: string,
+  partnerOwner: string,
+  transcriptRef: string,
+  reportRef: string,
+  score: number,
+  myTwinId: string,
+  targetAddress: string,
+  message: string,
+) => {
+  const MANDATE_PACKAGE_ID = process.env.EXPO_PUBLIC_MANDATE_PACKAGE_ID || PACKAGE_ID;
+  const tx = new Transaction();
+
+  tx.moveCall({
+    target: `${MANDATE_PACKAGE_ID}::mandate::record_a2a_result`,
+    arguments: [
+      tx.object(mandateId),
+      tx.pure.address(partnerOwner),
+      tx.pure.string(transcriptRef),
+      tx.pure.string(reportRef),
+      tx.pure.u8(Math.max(0, Math.min(99, Math.round(score)))),
+    ],
+  });
+
+  tx.moveCall({
+    target: `${PACKAGE_ID}::matchmaker::propose_match`,
+    arguments: [
+      tx.object(myTwinId),
+      tx.pure.address(targetAddress),
+      tx.pure.u8(clampProposalScore(score)),
+      tx.pure.string(message),
+    ],
+  });
+
+  return tx;
+};
