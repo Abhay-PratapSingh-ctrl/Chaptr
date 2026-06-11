@@ -158,13 +158,6 @@ const queryEndedMatchIds = async (): Promise<Set<string>> => {
 
 /**
  * Returns all PENDING proposals where myOwner is the target.
- *
- * IMPORTANT: The event name here must match what matchmaker.move actually
- * emits. If your contract emits `MatchProposal` or `ProposalCreated` instead
- * of `MatchProposed`, update the MoveEventType string below.
- *
- * To verify: run `sui client events --package <PACKAGE_ID>` on testnet
- * and check the event type names in the output.
  */
 const queryPendingIncomingProposals = async (myOwner: string) => {
   if (!PACKAGE_ID) return [];
@@ -172,7 +165,6 @@ const queryPendingIncomingProposals = async (myOwner: string) => {
   try {
     const result = await suiClient.queryEvents({
       query: {
-        // ⚠️  Verify this matches your matchmaker.move event name exactly.
         MoveEventType: `${PACKAGE_ID}::matchmaker::ProposalSent`,
       },
       limit: 50,
@@ -266,7 +258,6 @@ export const syncHumanMatchesFromSui = async (
           parsed.participant_b ?? parsed.owner_b ?? parsed.to,
         );
 
-        // The "other" person is whoever is not me
         const otherOwner = sameAddress(participantA, myOwner)
           ? participantB
           : participantA;
@@ -275,7 +266,6 @@ export const syncHumanMatchesFromSui = async (
         const txDigest = event.id?.txDigest ?? '';
         const timestampMs = event.timestampMs ?? null;
 
-        // Enrich from pool
         const poolEntry = poolEntries.find((e) =>
           sameAddress(e.owner, otherOwner),
         );
@@ -304,11 +294,9 @@ export const syncHumanMatchesFromSui = async (
       }),
     );
 
-    // Merge with existing local matches
     const localMatches = await readLocalMatches();
     const merged = mergeMatches(localMatches, chainMatches);
 
-    // Remove any locally stored matches that are now ended on-chain
     const live = merged.filter(
       (m) => !endedIds.has((m.matchId ?? '').toLowerCase()),
     );
@@ -331,24 +319,27 @@ export const syncHumanMatchesFromSui = async (
  * Agentic Web target autonomy — closes the loop on the receiving side.
  *
  * How it works:
- * 1. Queries MatchProposed events targeting myOwner
+ * 1. Queries ProposalSent events targeting myOwner
  * 2. Fetches the user's on-chain Mandate to read may_propose + min_score_to_propose
  * 3. For each proposal whose score meets the threshold, fires accept_proposal
- *    using a single Google popup (one JWT covers all proposals in the loop)
- * 4. Saves a guard key so each proposal is only accepted once, even if the
- *    screen re-mounts before the chain confirms
+ * 4. Saves a guard key BEFORE firing so we never double-accept even on crash
  *
- * Gate: reuses may_propose === true as the opt-in signal for both directions.
- * If you add a dedicated may_accept field to mandate.move, swap it in here.
+ * JWT sharing: accepts an optional existingJwt param. When Morning Briefing's
+ * Phase 4 already obtained a JWT (for auto-propose), it passes it here so
+ * processAutoAccepts reuses it — no second Google popup, no browser block.
+ * Falls back to getJwtForTransaction() only if no JWT was provided (e.g. when
+ * there were no outbound proposals in Phase 4).
  *
- * Call site: fire-and-forget from loadSavedState() in morning-briefing.tsx.
- * It's non-blocking — failures are warned but never surface to the user.
+ * Call site: fire-and-forget from loadSavedState() in morning-briefing.
  */
-export const processAutoAccepts = async (myOwner: string): Promise<void> => {
+export const processAutoAccepts = async (
+  myOwner: string,
+  existingJwt?: string,
+): Promise<void> => {
   const incomingProposals = await queryPendingIncomingProposals(myOwner);
   if (incomingProposals.length === 0) return;
 
-  // Read mandate
+  // Read mandate from chain — not from AsyncStorage
   const mandateIdStored = await AsyncStorage.getItem('chaptr:mandate-id');
   let mandateFields: any = null;
 
@@ -365,16 +356,11 @@ export const processAutoAccepts = async (myOwner: string): Promise<void> => {
     }
   }
 
-  // Opt-in gate: user must have enabled autonomous behaviour on their Mandate.
-  // We reuse may_propose as the "I want my Twin to act autonomously" flag for
-  // both outbound and inbound until a dedicated may_accept field is added.
+  // Opt-in gate
   if (mandateFields?.may_propose !== true) return;
 
-  const minScoreToAccept = Number(
-    mandateFields?.min_score_to_propose ?? 80,
-  );
+  const minScoreToAccept = Number(mandateFields?.min_score_to_propose ?? 80);
 
-  // Read myTwinId — needed by accept_proposal (matchmaker.move requires it)
   const myTwinId = await AsyncStorage.getItem('chaptr:my-twin-id');
   if (!myTwinId) {
     console.warn('[Auto-Accept] No local twin ID — cannot build accept tx');
@@ -395,37 +381,30 @@ export const processAutoAccepts = async (myOwner: string): Promise<void> => {
   const toProcess = actionable.filter(Boolean) as typeof incomingProposals;
   if (toProcess.length === 0) return;
 
-  // One Google popup covers all proposals — reuse the JWT across the loop
+  // ── JWT acquisition ───────────────────────────────────────────────────────
+  // If Phase 4 already got a JWT (for outbound proposals), reuse it here.
+  // This avoids a second Google popup and eliminates the browser popup blocker
+  // issue on web — one popup covers both propose and accept in one session.
+  // Reuse the JWT from Phase 4 if available — avoids a second Google popup.
+  // Falls back to getJwtForTransaction() if no JWT was passed in.
   let jwt: string;
   try {
-    jwt = await getJwtForTransaction();
+    jwt = existingJwt ?? await getJwtForTransaction();
   } catch (jwtErr) {
     console.warn('[Auto-Accept] JWT auth failed (non-blocking):', jwtErr);
     return;
   }
 
   for (const proposal of toProcess) {
-    console.log(
-      `[Auto-Accept] Twin evaluating proposal ${proposal.id.slice(0, 8)}… ` +
-      `Score ${proposal.compatibility_score}% ≥ threshold ${minScoreToAccept}%`,
-    );
+    // Write guard key BEFORE firing tx — if tx crashes, guard prevents retry loop
+    const guardKey = `chaptr:auto-accepted:${proposal.id.toLowerCase()}`;
+    await AsyncStorage.setItem(guardKey, new Date().toISOString());
 
     try {
-      // buildAcceptProposalTx requires both the proposalId and myTwinId
       const acceptTx = buildAcceptProposalTx(proposal.id, myTwinId);
       await executeZkLoginTransaction(acceptTx, myOwner, jwt);
-
-      // Save guard key immediately after success so we never double-accept
-      await AsyncStorage.setItem(
-        `chaptr:auto-accepted:${proposal.id.toLowerCase()}`,
-        new Date().toISOString(),
-      );
-
-      console.log(
-        `[Auto-Accept] Autonomously accepted proposal from ${proposal.proposer.slice(0, 8)}!`,
-      );
+      console.log(`[Auto-Accept] Accepted proposal from ${proposal.proposer.slice(0, 8)}`);
     } catch (txErr) {
-      // Non-blocking — log and continue to next proposal
       console.warn(
         `[Auto-Accept] Failed to accept proposal ${proposal.id}:`,
         txErr,
@@ -436,27 +415,16 @@ export const processAutoAccepts = async (myOwner: string): Promise<void> => {
 
 // ─── Merge logic ──────────────────────────────────────────────────────────────
 
-/**
- * Merges local matches with chain-discovered matches.
- *
- * Rules:
- * - Chain match wins on matchId (authoritative)
- * - Local match wins on proposalId if it has a real proposalId
- * - Local match wins on participantName if it was enriched at accept time
- * - Deduplication by matchId, then by participantOwner
- */
 const mergeMatches = (
   local: SyncedHumanMatch[],
   chain: SyncedHumanMatch[],
 ): SyncedHumanMatch[] => {
   const result = new Map<string, SyncedHumanMatch>();
 
-  // Start with chain matches (authoritative matchId)
   for (const m of chain) {
     result.set(m.matchId.toLowerCase(), m);
   }
 
-  // Overlay local data where it's richer
   for (const localMatch of local) {
     const key = (localMatch.matchId ?? localMatch.proposalId ?? '').toLowerCase();
     const existing = result.get(key);
@@ -483,7 +451,6 @@ const mergeMatches = (
           localMatch.participantScoutRef ?? existing.participantScoutRef,
       });
     } else {
-      // Local match not found on chain yet (indexing delay) — keep it
       result.set(key, localMatch);
     }
   }

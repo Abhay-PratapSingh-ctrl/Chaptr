@@ -1174,9 +1174,11 @@ export default function MorningBriefingScreen() {
         (action): action is ProposeAction => action.kind === 'propose',
       );
 
+      let phaseJwt: string | undefined;
+
       if (proposeActions.length > 0 && myOwner) {
         try {
-          const jwt = await getJwtForTransaction();
+          phaseJwt = await getJwtForTransaction();
           for (const action of proposeActions) {
             try {
               const proposeTx = buildProposeMatchTx(
@@ -1185,7 +1187,7 @@ export default function MorningBriefingScreen() {
                 action.score,
                 `Your Twin scored ${action.score}% in an A2A conversation. No human was involved.`,
               );
-              await executeZkLoginTransaction(proposeTx, myOwner, jwt);
+              await executeZkLoginTransaction(proposeTx, myOwner, phaseJwt);
               // Save the guard key immediately after success so we never
               // re-propose this candidate, even if the tab is closed mid-loop.
               await AsyncStorage.setItem(
@@ -1201,6 +1203,8 @@ export default function MorningBriefingScreen() {
           console.warn('[A2A] Post-scan JWT failed (non-blocking):', jwtErr);
         }
       }
+
+      return phaseJwt;
     } catch (err: any) {
       console.error('Failed to load pool profiles:', err);
       setError('Could not load your briefing. Check your connection.');
@@ -1209,7 +1213,7 @@ export default function MorningBriefingScreen() {
     }
   }, []);
 
-  const loadSavedState = useCallback(async () => {
+  const loadSavedState = useCallback(async (existingJwt?: string) => {
     const [passed, unlocked, proposal, myOwner, reportFeedback] = await Promise.all([
       readStringArray(PASSED_PROFILES_KEY),
       readStringArray(UNLOCKED_PROFILES_KEY),
@@ -1236,7 +1240,7 @@ export default function MorningBriefingScreen() {
     // ── Agentic Web: auto-accept incoming proposals that meet mandate threshold
     // Fire-and-forget — has its own JWT flow and guard keys internally.
     if (myOwner) {
-      processAutoAccepts(myOwner).catch((err) =>
+      processAutoAccepts(myOwner, existingJwt).catch((err) =>
         console.warn('[Auto-Accept] processAutoAccepts failed (non-blocking):', err),
       );
     }
@@ -1259,7 +1263,8 @@ export default function MorningBriefingScreen() {
           await loadSavedState();
           return;
         }
-        await Promise.all([loadPoolProfiles(), loadSavedState()]);
+        const phaseJwt = await loadPoolProfiles();
+        await loadSavedState(phaseJwt);
       };
       setIsLoading(true);
       loadScreen().catch((loadError) => {
