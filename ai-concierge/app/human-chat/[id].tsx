@@ -11,6 +11,9 @@ import {
   TextInput,
   TouchableOpacity,
   View,
+  Image,
+  Modal,
+  ScrollView,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -243,6 +246,12 @@ export default function HumanChatScreen() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [myOwner, setMyOwner] = useState<string | null>(null);
   const [showSafetyTips, setShowSafetyTips] = useState(false);
+
+  // Profile Modal State
+  const [scoutProfile, setScoutProfile] = useState<any>(null);
+  const [isProfileModalVisible, setIsProfileModalVisible] = useState(false);
+  const [isLoadingProfile, setIsLoadingProfile] = useState(false);
+  const [modalImageError, setModalImageError] = useState(false);
 
   const listRef = useRef<FlatList<Message> | null>(null);
 
@@ -528,6 +537,71 @@ export default function HumanChatScreen() {
     [displayName, match, matchId],
   );
 
+  const loadScoutProfile = async () => {
+    if (!match?.participantScoutRef) {
+      Alert.alert('Not found', 'Profile reference missing on-chain.');
+      return;
+    }
+    try {
+      setIsLoadingProfile(true);
+      setModalImageError(false);
+      const data = await fetchJsonFromWalrus(match.participantScoutRef);
+      setScoutProfile(data);
+      setIsProfileModalVisible(true);
+    } catch (err) {
+      Alert.alert('Error', 'Could not load profile from Walrus.');
+    } finally {
+      setIsLoadingProfile(false);
+    }
+  };
+
+  const renderProfileModal = () => (
+    <Modal visible={isProfileModalVisible} transparent animationType="slide">
+      <View style={styles.modalBackdrop}>
+        <View style={styles.modalContainer}>
+          <TouchableOpacity 
+            style={styles.closeModalBtn} 
+            onPress={() => setIsProfileModalVisible(false)}
+          >
+            <Text style={styles.closeModalText}>✕ Close</Text>
+          </TouchableOpacity>
+          <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.modalContent}>
+            <Image 
+              source={{ uri: (scoutProfile?.previewPhotoBlobId && !modalImageError) ? `https://aggregator.walrus-testnet.walrus.space/v1/${scoutProfile.previewPhotoBlobId}` : `https://api.dicebear.com/7.x/personas/png?seed=${encodeURIComponent(match?.participantOwner || displayName)}` }} 
+              style={styles.modalImage} 
+              onError={() => setModalImageError(true)}
+            />
+            <Text style={styles.modalName}>{scoutProfile?.displayName || displayName}{scoutProfile?.age ? `, ${scoutProfile.age}` : ''}</Text>
+            {scoutProfile?.location ? <Text style={styles.modalLocation}>📍 {scoutProfile.location}</Text> : null}
+            
+            <View style={styles.modalBioBox}>
+              <Text style={styles.modalBioTitle}>Bio</Text>
+              <Text style={styles.modalBioText}>{scoutProfile?.bio || 'No bio provided.'}</Text>
+            </View>
+
+            {scoutProfile?.lookingFor ? (
+              <View style={styles.modalBioBox}>
+                <Text style={styles.modalBioTitle}>Looking For</Text>
+                <Text style={styles.modalBioText}>{scoutProfile.lookingFor}</Text>
+              </View>
+            ) : null}
+
+            {scoutProfile?.traits?.length > 0 && (
+              <View style={styles.modalTraitsBox}>
+                {scoutProfile.traits.map((t: string, i: number) => (
+                  <View key={i} style={styles.modalTraitPill}>
+                    <Text style={styles.modalTraitText}>{t}</Text>
+                  </View>
+                ))}
+              </View>
+            )}
+            <View style={{ height: 40 }} />
+          </ScrollView>
+        </View>
+      </View>
+    </Modal>
+  );
+
   if (isLoading) {
     return (
       <SafeAreaView style={styles.root}>
@@ -556,6 +630,10 @@ export default function HumanChatScreen() {
           </View>
 
           <View style={styles.headerActions}>
+            <TouchableOpacity onPress={loadScoutProfile} style={styles.headerAction} disabled={isLoadingProfile}>
+              <Text style={styles.viewProfileText}>{isLoadingProfile ? 'Loading...' : 'Profile'}</Text>
+            </TouchableOpacity>
+
             <TouchableOpacity onPress={() => openReflection('1')} style={styles.headerAction}>
               <Text style={styles.blockHeaderText}>Block</Text>
             </TouchableOpacity>
@@ -661,6 +739,7 @@ export default function HumanChatScreen() {
           </TouchableOpacity>
         </View>
       </KeyboardAvoidingView>
+      {renderProfileModal()}
     </SafeAreaView>
   );
 }
@@ -687,6 +766,7 @@ const styles = StyleSheet.create({
   headerAction: { alignItems: 'flex-end' },
   blockHeaderText: { color: '#fca5a5', fontSize: 13, fontWeight: '900' },
   refreshText: { color: '#A299A8', fontSize: 13, fontWeight: '800' },
+  viewProfileText: { color: '#D94A8C', fontSize: 13, fontWeight: '800' },
   matchBanner: {
     margin: 14,
     padding: 14,
@@ -748,12 +828,30 @@ const styles = StyleSheet.create({
     borderBottomLeftRadius: 4,
   },
   systemBubble: {
-    backgroundColor: 'rgba(255,255,255,0.04)',
-    borderWidth: 1,
-    borderColor: '#2A2432',
+    backgroundColor: 'rgba(217,74,140,0.1)',
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
   },
-  messageText: { color: '#FDFBF7', fontSize: 15, lineHeight: 21 },
   systemText: { color: '#A299A8', fontSize: 13, lineHeight: 19, textAlign: 'center' },
+  systemBubbleText: { color: '#D8D0DD', fontSize: 13, lineHeight: 18 },
+  modalBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.85)', justifyContent: 'flex-end' },
+  modalContainer: { backgroundColor: '#1E1826', borderTopLeftRadius: 24, borderTopRightRadius: 24, maxHeight: '90%' },
+  closeModalBtn: { alignSelf: 'flex-end', padding: 16 },
+  closeModalText: { color: '#94a3b8', fontSize: 14, fontWeight: '700' },
+  modalContent: { paddingHorizontal: 20 },
+  modalImage: { width: '100%', height: 350, borderRadius: 16, backgroundColor: '#2A2432', marginBottom: 16 },
+  modalImagePlaceholder: { alignItems: 'center', justifyContent: 'center' },
+  modalImageInitials: { color: '#D8D0DD', fontSize: 64, fontWeight: '900' },
+  modalName: { color: '#FFFFFF', fontSize: 24, fontWeight: '900', marginBottom: 4 },
+  modalLocation: { color: '#D94A8C', fontSize: 14, fontWeight: '700', marginBottom: 16 },
+  modalBioBox: { backgroundColor: 'rgba(255,255,255,0.03)', borderRadius: 12, padding: 16, marginBottom: 12 },
+  modalBioTitle: { color: '#94a3b8', fontSize: 11, fontWeight: '800', textTransform: 'uppercase', marginBottom: 6 },
+  modalBioText: { color: '#D8D0DD', fontSize: 15, lineHeight: 22 },
+  modalTraitsBox: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 4 },
+  modalTraitPill: { backgroundColor: 'rgba(122,62,184,0.15)', borderWidth: 1, borderColor: 'rgba(122,62,184,0.3)', borderRadius: 20, paddingHorizontal: 12, paddingVertical: 6 },
+  modalTraitText: { color: '#e9d5ff', fontSize: 12, fontWeight: '700' },
+  messageText: { color: '#FDFBF7', fontSize: 15, lineHeight: 21 },
   inputBar: {
     flexDirection: 'row',
     alignItems: 'flex-end',

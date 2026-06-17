@@ -19,12 +19,7 @@ import { LinearGradient } from 'expo-linear-gradient';
 import { router, useFocusEffect, type Href } from 'expo-router';
 import * as WebBrowser from 'expo-web-browser';
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
-import {
-  buildWithdrawProposalTx,
-  buildRecordA2AResultTx,
-  buildProposeMatchTx,
-  buildRecordAndProposePTB,
-} from '@/utils/suiTransactions';
+import { buildAcceptProposalTx, buildProposeMatchTx, buildRecordA2AResultTx, buildRecordAndProposePTB, buildWithdrawProposalTx, buildEndMatchTx } from '@/utils/suiTransactions';
 import {
   fetchZkProof,
   loadZkLoginParams,
@@ -32,6 +27,7 @@ import {
   getJwtForTransaction,
   executeZkLoginTransaction,
 } from '@/utils/zkLoginService';
+import { emitEvent } from '@/utils/telemetry';
 import {
   readBlockedProfileKeys,
   readHiddenProfileIds,
@@ -812,6 +808,8 @@ export default function MorningBriefingScreen() {
   const [activeProposal, setActiveProposal] = useState<ActiveProposal | null>(null);
   const [hasLocalTwin, setHasLocalTwin] = useState<boolean | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [loadingPhase, setLoadingPhase] = useState('Scouting the Twin Pool…');
+  const [isAwaitingAuth, setIsAwaitingAuth] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isWithdrawing, setIsWithdrawing] = useState(false);
   const [isLoggingOut, setIsLoggingOut] = useState(false);
@@ -824,6 +822,7 @@ export default function MorningBriefingScreen() {
 
   const loadPoolProfiles = useCallback(async () => {
     setIsLoading(true);
+    setLoadingPhase('Scouting the Twin Pool…');
     setError(null);
 
     try {
@@ -1012,6 +1011,7 @@ export default function MorningBriefingScreen() {
       // Runs only if Mandate allows. Each candidate is processed serially so
       // Groq rate limits are never hit. Cache is checked first — if a result
       // exists from a prior session it is returned instantly with no API call.
+      setLoadingPhase('Running compatibility analysis…');
 
       // FIX: split propose actions from record actions so Phase 4 can skip
       // record_a2a_result entirely, cutting Enoki proof generation in half.
@@ -1175,6 +1175,7 @@ export default function MorningBriefingScreen() {
       // ── Phase 4: fire on-chain propose actions only (ONE Google popup) ────
       //
       // CRITICAL FIX for Enoki 429 / popup-on-every-navigation bug:
+      setLoadingPhase('Your Twin is making decisions…');
       //
       // We intentionally skip 'record' actions here. Each executeZkLoginTransaction
       // call costs one Enoki ZK proof generation. The free tier limit is tight —
@@ -1206,33 +1207,31 @@ export default function MorningBriefingScreen() {
       // If Phase 4 proposes first, Twin is in escrow → auto-accept can't use it.
       // By accepting first, we prioritize completing existing connections.
       let twinConsumedByAccept = false;
-      const myTwinIdForAccept = await AsyncStorage.getItem('chaptr:my-twin-id');
-
-      if (myOwner && mandateFields?.may_propose === true) {
+      
+      if (myOwner && !isInActiveMatch && mandateFields?.may_propose === true) {
         try {
+          setIsLoading(false);
+          setIsAwaitingAuth(true);
           phaseJwt = await getJwtForTransaction();
+          setIsAwaitingAuth(false);
+          setIsLoading(true);
           console.log('[Pre-Phase4] JWT obtained — running auto-accept before outbound proposals');
 
-          // Run auto-accept synchronously (not fire-and-forget) so we know
-          // whether the Twin was consumed before we try Phase 4.
-          await processAutoAccepts(myOwner, phaseJwt);
-
-          // Check if Twin is still available after auto-accept
-          if (myTwinIdForAccept) {
-            try {
-              const twinCheck = await suiClient.getObject({
-                id: myTwinIdForAccept,
-                options: { showType: true },
-              });
-              if (twinCheck.error || !twinCheck.data) {
-                twinConsumedByAccept = true;
-                console.log('[Pre-Phase4] Twin consumed by auto-accept — skipping outbound proposals');
-              }
-            } catch {
-              twinConsumedByAccept = true;
-            }
+          // Run auto-accept synchronously so we know if the Twin was consumed
+          const autoAcceptResult = await processAutoAccepts(myOwner, phaseJwt);
+          
+          if (autoAcceptResult?.accepted) {
+            console.log('[Pre-Phase4] Twin consumed by auto-accept — updating UI and skipping outbound proposals');
+            // Wait for Sui indexer to catch up before fetching new match
+            await new Promise(resolve => setTimeout(resolve, 3000));
+            const freshMatches = await syncHumanMatchesFromSui(myOwner).catch(() => []);
+            setHumanMatches(freshMatches);
+            setActiveProposal(null);
+            twinConsumedByAccept = true;
           }
         } catch (jwtErr) {
+          setIsAwaitingAuth(false);
+          setIsLoading(true);
           console.warn('[Pre-Phase4] JWT/auto-accept failed (non-blocking):', jwtErr);
         }
       }
@@ -1251,6 +1250,12 @@ export default function MorningBriefingScreen() {
             }
 
             try {
+              emitEvent('propose_fired', {
+                target: action.entryOwner.slice(0, 10),
+                score: action.score,
+                twinId: action.twinId.slice(0, 10),
+              }, myOwner, `propose_fired:${action.entryOwner.slice(0, 16)}`);
+
               // PTB: record_a2a_result + propose_match in one tx = 1 Enoki proof
               const ptb = buildRecordAndProposePTB(
                 action.mandateIdStored,
@@ -1262,14 +1267,29 @@ export default function MorningBriefingScreen() {
                 action.entryOwner,
                 `Your Twin scored ${action.score}% in an A2A conversation. No human was involved.`,
               );
-              await executeZkLoginTransaction(ptb, myOwner, phaseJwt);
+              const txResult = await executeZkLoginTransaction(ptb, myOwner, phaseJwt);
               await AsyncStorage.setItem(
                 `chaptr:auto-proposed:${action.entryOwner.toLowerCase()}`,
                 new Date().toISOString(),
               );
               console.log('[PTB] Recorded + proposed to', action.entryOwner.slice(0, 10), 'score:', action.score);
-            } catch (actionErr) {
+
+              emitEvent('propose_result', {
+                target: action.entryOwner.slice(0, 10),
+                score: action.score,
+                result: 'success',
+                txDigest: txResult?.digest ?? '',
+              }, myOwner, `propose_result:${action.entryOwner.slice(0, 16)}`);
+            } catch (actionErr: any) {
+              const errMsg = actionErr?.message ?? String(actionErr);
               console.warn('[PTB] Batch failed, falling back to record-only:', actionErr);
+              
+              emitEvent('propose_result', {
+                target: action.entryOwner.slice(0, 10),
+                score: action.score,
+                result: 'failed',
+                error: errMsg,
+              }, myOwner, `propose_result:${action.entryOwner.slice(0, 16)}`);
               // Fallback: if PTB fails (e.g. Twin already in escrow),
               // fire record_a2a_result alone so A2A is still anchored on-chain.
               try {
@@ -1298,6 +1318,7 @@ export default function MorningBriefingScreen() {
       setError('Could not load your briefing. Check your connection.');
     } finally {
       setIsLoading(false);
+      setIsAwaitingAuth(false);
     }
   }, []);
 
@@ -1516,12 +1537,7 @@ export default function MorningBriefingScreen() {
         >
           <View style={styles.cardHeader}>
             <View style={styles.avatar}>
-              <Image source={{ uri: item.photoUrl }} style={styles.avatarImage} blurRadius={isUnlocked ? 0 : 18} />
-              {!isUnlocked && (
-                <View style={styles.lockOverlay}>
-                  <Text style={styles.lockIcon}>🔒</Text>
-                </View>
-              )}
+              <Image source={{ uri: item.photoUrl }} style={styles.avatarImage} />
             </View>
             <View style={styles.profileInfo}>
               <View style={styles.nameRow}>
@@ -1627,7 +1643,7 @@ export default function MorningBriefingScreen() {
       <SafeAreaView style={styles.root}>
         <View style={styles.loadingContainer}>
           <ActivityIndicator color="#D94A8C" size="large" />
-          <Text style={styles.loadingText}>Scouting the Twin Pool…</Text>
+          <Text style={styles.loadingText}>{loadingPhase}</Text>
         </View>
       </SafeAreaView>
     );
@@ -1680,6 +1696,15 @@ export default function MorningBriefingScreen() {
             </TouchableOpacity>
           </View>
         </View>
+
+        {/* Auth Banner (Non-blocking spinner replacement) */}
+        {isAwaitingAuth && (
+          <View style={styles.authBanner}>
+            <Text style={styles.authBannerText}>
+              ⚡ Your Twin is signing a transaction…
+            </Text>
+          </View>
+        )}
 
         {/* Active Human Match Banner */}
         {activeHumanMatch ? (
@@ -1872,7 +1897,9 @@ const styles = StyleSheet.create({
   pillButtonDangerText: { color: '#f87171' },
   matchBannerOuter: { borderRadius: 22, overflow: 'hidden', borderWidth: 1, borderColor: 'rgba(74,222,128,0.38)', marginBottom: 18, shadowColor: '#4ade80', shadowOffset: { width: 0, height: 0 }, shadowOpacity: 0.18, shadowRadius: 16, elevation: 8 },
   matchBannerGradient: { padding: 18 },
-  matchBannerTopRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 },
+  matchBannerTopRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 12 },
+  authBanner: { backgroundColor: 'rgba(217,74,140,0.1)', borderColor: 'rgba(217,74,140,0.3)', borderWidth: 1, paddingVertical: 12, paddingHorizontal: 16, borderRadius: 8, marginHorizontal: 16, marginBottom: 16, alignItems: 'center' },
+  authBannerText: { color: '#D94A8C', fontSize: 14, fontWeight: '600' },
   matchBannerKicker: { color: '#4ade80', fontSize: 11, fontWeight: '900', letterSpacing: 2 },
   livePill: { flexDirection: 'row', alignItems: 'center', gap: 5, borderWidth: 1, borderColor: 'rgba(74,222,128,0.5)', borderRadius: 999, paddingHorizontal: 10, paddingVertical: 4, backgroundColor: 'rgba(74,222,128,0.10)' },
   liveDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: '#4ade80' },

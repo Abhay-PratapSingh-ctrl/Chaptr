@@ -13,6 +13,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
 import { buildAcceptProposalTx } from './suiTransactions';
 import { getJwtForTransaction, executeZkLoginTransaction } from './zkLoginService';
+import { emitEvent } from './telemetry';
 
 const PACKAGE_ID = process.env.EXPO_PUBLIC_PACKAGE_ID || '';
 const TWIN_POOL_ID = process.env.EXPO_PUBLIC_TWIN_POOL_ID || '';
@@ -374,7 +375,7 @@ export const syncHumanMatchesFromSui = async (
 export const processAutoAccepts = async (
   myOwner: string,
   existingJwt?: string,
-): Promise<void> => {
+): Promise<{ accepted: boolean; matchOwner?: string }> => {
   // ── Step 1: Global match check ─────────────────────────────────────────────
   // getMatchedOwners() returns ALL owners currently in ANY active match.
   // If I'm in the set, my Twin is locked inside a Match object and
@@ -386,14 +387,22 @@ export const processAutoAccepts = async (
 
   if (matchedOwners.has(myOwner.toLowerCase())) {
     console.log('[Auto-Accept] Skipping — I am already in an active match (Twin locked)');
-    return;
+
+    // ── TELEMETRY: mandate blocked (in active match) ──────────────────
+    emitEvent('mandate_check', {
+      context: 'auto_accept',
+      allowed: false,
+      reason: 'already_in_active_match',
+    }, myOwner, `mandate:auto_accept:${myOwner.slice(0, 8)}`);
+
+    return { accepted: false };
   }
 
   // ── Step 2: Query incoming proposals ───────────────────────────────────────
   const incomingProposals = await queryPendingIncomingProposals(myOwner);
   if (incomingProposals.length === 0) {
     console.log('[Auto-Accept] No incoming proposals found');
-    return;
+    return { accepted: false };
   }
 
   console.log(`[Auto-Accept] Found ${incomingProposals.length} ProposalSent event(s) targeting me`);
@@ -411,22 +420,38 @@ export const processAutoAccepts = async (
       mandateFields = (mandateObj.data?.content as any)?.fields ?? null;
     } catch (err) {
       console.warn('[Auto-Accept] Failed to fetch mandate:', err);
-      return;
+      return { accepted: false };
     }
   }
 
   // Opt-in gate
   if (mandateFields?.may_propose !== true) {
     console.log('[Auto-Accept] Mandate may_propose is not true — skipping');
-    return;
+
+    // ── TELEMETRY: mandate blocked (not allowed) ─────────────────────
+    emitEvent('mandate_check', {
+      context: 'auto_accept',
+      allowed: false,
+      reason: 'may_propose_not_true',
+    }, myOwner, `mandate:auto_accept:${myOwner.slice(0, 8)}`);
+
+    return { accepted: false };
   }
+
+  // ── TELEMETRY: mandate allowed ────────────────────────────────────
+  emitEvent('mandate_check', {
+    context: 'auto_accept',
+    allowed: true,
+    minScoreToAccept: Number(mandateFields?.min_score_to_propose ?? 80),
+    incomingProposals: incomingProposals.length,
+  }, myOwner, `mandate:auto_accept:${myOwner.slice(0, 8)}`);
 
   const minScoreToAccept = Number(mandateFields?.min_score_to_propose ?? 80);
 
   const myTwinId = await AsyncStorage.getItem('chaptr:my-twin-id');
   if (!myTwinId) {
     console.warn('[Auto-Accept] No local twin ID — cannot build accept tx');
-    return;
+    return { accepted: false };
   }
 
   // Verify my Twin is still available (not wrapped inside a Match or Proposal)
@@ -434,11 +459,11 @@ export const processAutoAccepts = async (
     const twinObj = await suiClient.getObject({ id: myTwinId, options: { showType: true } });
     if (twinObj.error || !twinObj.data) {
       console.warn(`[Auto-Accept] My Twin ${myTwinId.slice(0, 12)}… is unavailable (consumed/wrapped). Cannot accept.`);
-      return;
+      return { accepted: false };
     }
   } catch {
     console.warn('[Auto-Accept] Failed to verify Twin status — skipping');
-    return;
+    return { accepted: false };
   }
 
   // ── Step 4: Filter proposals ───────────────────────────────────────────────
@@ -516,7 +541,7 @@ export const processAutoAccepts = async (
 
   if (toProcess.length === 0) {
     console.log('[Auto-Accept] No actionable proposals after filtering');
-    return;
+    return { accepted: false };
   }
 
   console.log(`[Auto-Accept] ${toProcess.length} live proposal(s) to process`);
@@ -529,7 +554,7 @@ export const processAutoAccepts = async (
     jwt = existingJwt ?? await getJwtForTransaction();
   } catch (jwtErr) {
     console.warn('[Auto-Accept] JWT auth failed (non-blocking):', jwtErr);
-    return;
+    return { accepted: false };
   }
 
   // ── Step 6: Accept ONE proposal, then stop ─────────────────────────────────
@@ -540,6 +565,14 @@ export const processAutoAccepts = async (
     const guardKey = `chaptr:auto-accepted:${proposal.id.toLowerCase()}`;
 
     try {
+      // ── TELEMETRY: accept fired ─────────────────────────────────────
+      emitEvent('accept_fired', {
+        proposalId: proposal.id.slice(0, 12),
+        proposer: proposal.proposer.slice(0, 10),
+        score: proposal.compatibility_score,
+        myTwinId: myTwinId.slice(0, 12),
+      }, myOwner, `accept_fired:${proposal.id.slice(0, 16)}`);
+
       const acceptTx = buildAcceptProposalTx(proposal.id, myTwinId);
       await executeZkLoginTransaction(acceptTx, myOwner, jwt);
 
@@ -547,8 +580,24 @@ export const processAutoAccepts = async (
       await AsyncStorage.setItem(guardKey, `accepted:${new Date().toISOString()}`);
       console.log(`[Auto-Accept] ✅ Accepted proposal from ${proposal.proposer.slice(0, 8)} — match formed!`);
 
-      // Stop here — Twin is now locked, no further accepts are possible
-      break;
+      // ── TELEMETRY: accept succeeded ───────────────────────────────────
+      emitEvent('accept_result', {
+        proposalId: proposal.id.slice(0, 12),
+        proposer: proposal.proposer.slice(0, 10),
+        score: proposal.compatibility_score,
+        result: 'success',
+      }, myOwner, `accept_result:${proposal.id.slice(0, 16)}`);
+
+      // ── TELEMETRY: match formed (optimistic) ────────────────────────
+      emitEvent('match_formed', {
+        proposalId: proposal.id.slice(0, 12),
+        proposer: proposal.proposer.slice(0, 10),
+        accepter: myOwner.slice(0, 10),
+        score: proposal.compatibility_score,
+      }, myOwner, `match_formed:${proposal.id.slice(0, 16)}`);
+
+      // Stop here and notify caller — Twin is now locked
+      return { accepted: true, matchOwner: proposal.proposer };
     } catch (txErr: any) {
       const errMsg = txErr?.message ?? String(txErr);
       console.warn(`[Auto-Accept] ❌ Failed to accept proposal ${proposal.id.slice(0, 18)}:`, errMsg);
@@ -556,8 +605,19 @@ export const processAutoAccepts = async (
       // Mark as failed to prevent infinite retries on permanently broken proposals
       // (e.g., proposal already rejected/withdrawn on-chain but events still exist)
       await AsyncStorage.setItem(guardKey, `failed:${new Date().toISOString()}`);
+
+      // ── TELEMETRY: accept failed ────────────────────────────────────
+      emitEvent('accept_result', {
+        proposalId: proposal.id.slice(0, 12),
+        proposer: proposal.proposer.slice(0, 10),
+        score: proposal.compatibility_score,
+        result: 'failed',
+        error: errMsg.slice(0, 100),
+      }, myOwner, `accept_result:${proposal.id.slice(0, 16)}`);
     }
   }
+
+  return { accepted: false };
 };
 
 // ─── Merge logic ──────────────────────────────────────────────────────────────

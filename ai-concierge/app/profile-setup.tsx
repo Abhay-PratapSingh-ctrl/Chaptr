@@ -289,9 +289,10 @@ export default function ProfileSetupScreen() {
       photoBlobIds = await Promise.all(
         photos.filter(Boolean).map((uri) => uploadImageToWalrus(uri)),
       );
-    } catch (error) {
-      console.warn('Photo upload skipped, continuing mint:', error);
-      photoBlobIds = [];
+    } catch (error: any) {
+      Alert.alert('Photo Upload Failed', `Walrus rejected the image: ${error.message || error}. Please try a smaller image or try again.`);
+      setIsMinting(false);
+      return;
     }
 
     const profileFacts = buildProfileMemoryFacts({

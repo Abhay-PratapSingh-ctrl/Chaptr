@@ -2,6 +2,7 @@
 // Central AI engine for Chaptr — A2A conversations, compatibility analysis.
 
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { emitEvent } from './telemetry';
 
 const GROQ_API_KEY = process.env.EXPO_PUBLIC_GROQ_API_KEY || '';
 const GROQ_MODEL = 'llama-3.1-8b-instant';
@@ -91,11 +92,35 @@ export const runA2AConversation = async (myProfile, candidateProfile) => {
   const myOwner = myProfile.owner;
   const candidateOwner = candidateProfile.owner;
 
+  // ── TELEMETRY: A2A start ───────────────────────────────────────────────
+  const pairKey = `${(myOwner ?? '').slice(0, 8)}:${(candidateOwner ?? '').slice(0, 8)}`;
+  emitEvent('a2a_start', {
+    myOwner: myOwner?.slice(0, 10) ?? null,
+    candidateOwner: candidateOwner?.slice(0, 10) ?? null,
+    candidateName: candidateProfile.displayName || 'Unknown',
+  }, myOwner ?? '', `a2a_start:${pairKey}`);
+
   // ── Cache check — skip Groq entirely if already ran ──────────────────────
   if (myOwner && candidateOwner) {
     const cached = await getCachedA2AResult(myOwner, candidateOwner);
     if (cached) {
       console.log('[A2A] Cache hit for', candidateOwner.slice(0, 10));
+
+      // ── TELEMETRY: A2A cache hit (complete immediately) ────────────────
+      emitEvent('a2a_complete', {
+        source: 'cache',
+        candidateOwner: candidateOwner.slice(0, 10),
+        candidateName: candidateProfile.displayName || 'Unknown',
+        score: cached.score,
+        summary: cached.summary || null,
+        chemistry: cached.chemistry || null,
+        recommendation: cached.recommendation,
+        transcriptRef: cached.transcriptRef?.slice(0, 14) ?? null,
+        reportRef: cached.reportRef?.slice(0, 14) ?? null,
+        messageCount: cached.transcript?.length ?? 0,
+        transcript: cached.transcript || [],
+      }, myOwner, `a2a_complete:${pairKey}`);
+
       return cached;
     }
   }
@@ -116,6 +141,14 @@ export const runA2AConversation = async (myProfile, candidateProfile) => {
 
   transcript.push({ role: 'twin_a', speaker: myName, message: opener.trim() });
 
+  // ── TELEMETRY: first A2A message ─────────────────────────────────────
+  emitEvent('a2a_message', {
+    speaker: myName,
+    role: 'twin_a',
+    messageIndex: 0,
+    preview: opener.trim().slice(0, 80),
+  }, myOwner ?? '', `a2a_msg:${pairKey}:0`);
+
   // 3 exchanges back and forth
   for (let i = 0; i < 3; i++) {
     const conversationSoFar = transcript
@@ -130,6 +163,14 @@ export const runA2AConversation = async (myProfile, candidateProfile) => {
 
     transcript.push({ role: 'twin_b', speaker: candidateName, message: bResponse.trim() });
 
+    // ── TELEMETRY: Twin B message ──────────────────────────────────────
+    emitEvent('a2a_message', {
+      speaker: candidateName,
+      role: 'twin_b',
+      messageIndex: transcript.length - 1,
+      preview: bResponse.trim().slice(0, 80),
+    }, myOwner ?? '', `a2a_msg:${pairKey}:${transcript.length - 1}`);
+
     // Twin A responds back (skip on last exchange)
     if (i < 2) {
       const conversationWithB = transcript
@@ -142,6 +183,14 @@ export const runA2AConversation = async (myProfile, candidateProfile) => {
       );
 
       transcript.push({ role: 'twin_a', speaker: myName, message: aResponse.trim() });
+
+      // ── TELEMETRY: Twin A response ────────────────────────────────────
+      emitEvent('a2a_message', {
+        speaker: myName,
+        role: 'twin_a',
+        messageIndex: transcript.length - 1,
+        preview: aResponse.trim().slice(0, 80),
+      }, myOwner ?? '', `a2a_msg:${pairKey}:${transcript.length - 1}`);
     }
   }
 
@@ -208,6 +257,14 @@ recommendation must be exactly "propose" or "pass".`;
     console.warn('[A2A] Report generation failed, using fallback:', err);
   }
 
+  // ── TELEMETRY: report generated ──────────────────────────────────────
+  emitEvent('report_generated', {
+    candidateName,
+    score: reportData.score,
+    recommendation: reportData.recommendation,
+    chemistry: reportData.chemistry?.slice(0, 80) ?? null,
+  }, myOwner ?? '', `report:${pairKey}`);
+
   // Upload transcript and report to Walrus
   const transcriptPayload = {
     version: 1,
@@ -238,8 +295,23 @@ recommendation must be exactly "propose" or "pass".`;
       uploadJsonToWalrus(transcriptPayload),
       uploadJsonToWalrus(reportPayload),
     ]);
+
+    // ── TELEMETRY: Walrus upload success ──────────────────────────────
+    emitEvent('walrus_upload', {
+      candidateName,
+      transcriptRef: transcriptRef?.slice(0, 14) ?? null,
+      reportRef: reportRef?.slice(0, 14) ?? null,
+      status: 'success',
+    }, myOwner ?? '', `walrus:${pairKey}`);
   } catch (err) {
     console.warn('[A2A] Walrus upload failed (non-blocking):', err);
+
+    // ── TELEMETRY: Walrus upload failed ──────────────────────────────
+    emitEvent('walrus_upload', {
+      candidateName,
+      status: 'failed',
+      error: err?.message || 'unknown',
+    }, myOwner ?? '', `walrus:${pairKey}`);
   }
 
   const result = {
@@ -254,6 +326,21 @@ recommendation must be exactly "propose" or "pass".`;
     candidateName,
     candidateOwner: candidateOwner || null,
   };
+
+  // ── TELEMETRY: A2A complete (fresh Groq path) ────────────────────────
+  emitEvent('a2a_complete', {
+    source: 'groq',
+    candidateOwner: candidateOwner?.slice(0, 10) ?? null,
+    candidateName,
+    score: reportData.score,
+    recommendation: reportData.recommendation,
+    summary: reportData.summary || null,
+    chemistry: reportData.chemistry || null,
+    transcriptRef: transcriptRef?.slice(0, 14) ?? null,
+    reportRef: reportRef?.slice(0, 14) ?? null,
+    messageCount: transcript.length,
+    transcript: transcript,
+  }, myOwner ?? '', `a2a_complete:${pairKey}`);
 
   // ── Persist to AsyncStorage so refresh doesn't re-run Groq ───────────────
   if (myOwner && candidateOwner) {
