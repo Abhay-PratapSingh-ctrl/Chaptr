@@ -29,8 +29,7 @@ import {
   type ScoutCapsule,
 } from '@/utils/twinMemory';
 import { buildProposeMatchTx } from '@/utils/suiTransactions';
-import { getJwtForTransaction, loadZkLoginParams, fetchZkProof } from '@/utils/zkLoginService';
-import { executeSponsoredZkLogin } from '@/utils/shinamiSponsor';
+import { getJwtForTransaction, executeSponsoredZkLoginTransaction } from '@/utils/zkLoginService';
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -590,17 +589,6 @@ export default function ChatScreen() {
       }
 
       const jwt = await getJwtForProposal();
-      const { ephemeralKeyPair, maxEpoch, randomness } = await loadZkLoginParams();
-      const { zkProof, addressSeed, userAddress } = await fetchZkProof(
-        jwt,
-        ephemeralKeyPair,
-        maxEpoch,
-        randomness,
-      );
-
-      if (userAddress.toLowerCase() !== myOwner.toLowerCase()) {
-        throw new Error('Selected Google account does not match this browser’s Chaptr identity.');
-      }
 
       const tx = buildProposeMatchTx(
         myTwinId,
@@ -609,9 +597,7 @@ export default function ChatScreen() {
         `Focus proposal to ${persona.name}. The recipient can talk to my Twin before accepting.`,
       );
 
-      const result = await executeSponsoredZkLogin(
-        tx, userAddress, ephemeralKeyPair, zkProof, addressSeed, maxEpoch, suiClient
-      );
+      const result = await executeSponsoredZkLoginTransaction(tx, myOwner, jwt);
 
       const proposalId = extractProposalIdFromResult(result);
 

@@ -1,9 +1,8 @@
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
-import { executeSponsoredZkLogin } from '@/utils/shinamiSponsor';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { generateNonce, generateRandomness, getZkLoginSignature, getExtendedEphemeralPublicKey, genAddressSeed } from '@mysten/sui/zklogin';
 import { jwtDecode } from 'jwt-decode';
-import { toBase64 } from '@mysten/sui/utils';
+import { toBase64, fromBase64 } from '@mysten/sui/utils';
 import { Platform } from 'react-native';
 import { Transaction } from '@mysten/sui/transactions';
 import * as AuthSession from 'expo-auth-session';
@@ -331,7 +330,75 @@ export const executeZkLoginTransaction = async (
     throw new Error('Selected Google account does not match this browser identity.');
   }
 
-  return executeSponsoredZkLogin(
-    tx, userAddress, ephemeralKeyPair, zkProof, addressSeed, maxEpoch, client
+  tx.setSender(userAddress);
+  const txBytesUint8 = await tx.build({ client });
+  const { signature: userSignature } = await ephemeralKeyPair.signTransaction(txBytesUint8);
+
+  const zkSignature = getZkLoginSignature({
+    inputs: { ...zkProof, addressSeed },
+    maxEpoch,
+    userSignature,
+  });
+
+  return client.executeTransactionBlock({
+    transactionBlock: txBytesUint8,
+    signature: zkSignature,
+    options: { showEffects: true, showEvents: true, showObjectChanges: true },
+  });
+};
+
+/**
+ * Executes a Transaction by sending it to our Vercel API for Shinami Gas Sponsorship.
+ * Eliminates the need for the user to hold SUI for gas.
+ */
+export const executeSponsoredZkLoginTransaction = async (
+  tx: Transaction,
+  expectedOwner: string,
+  jwt: string,
+) => {
+  const { ephemeralKeyPair, maxEpoch, randomness } = await loadZkLoginParams();
+  const { zkProof, addressSeed, userAddress } = await fetchZkProof(
+    jwt,
+    ephemeralKeyPair,
+    maxEpoch,
+    randomness,
   );
+
+  if (userAddress.toLowerCase() !== expectedOwner.toLowerCase()) {
+    throw new Error('Selected Google account does not match this browser identity.');
+  }
+
+  tx.setSender(userAddress);
+  const txBytesUint8 = await tx.build({ client, onlyTransactionKind: true });
+
+  const sponsorRes = await fetch('/api/sponsor', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      txBytes: toBase64(txBytesUint8),
+      sender: userAddress,
+    })
+  });
+
+  if (!sponsorRes.ok) {
+    const text = await sponsorRes.text();
+    throw new Error(`Sponsor API failed: ${text}`);
+  }
+
+  const { txBytes, signature: sponsorSignature } = await sponsorRes.json();
+  const sponsoredTxBytesUint8 = fromBase64(txBytes);
+
+  const { signature: userSignature } = await ephemeralKeyPair.signTransaction(sponsoredTxBytesUint8);
+
+  const zkSignature = getZkLoginSignature({
+    inputs: { ...zkProof, addressSeed },
+    maxEpoch,
+    userSignature,
+  });
+
+  return client.executeTransactionBlock({
+    transactionBlock: sponsoredTxBytesUint8,
+    signature: [zkSignature, sponsorSignature],
+    options: { showEffects: true, showEvents: true, showObjectChanges: true },
+  });
 };

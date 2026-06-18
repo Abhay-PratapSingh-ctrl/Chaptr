@@ -12,7 +12,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
 import { buildAcceptProposalTx } from './suiTransactions';
-import { getJwtForTransaction, executeZkLoginTransaction } from './zkLoginService';
+import { getJwtForTransaction, executeSponsoredZkLoginTransaction } from './zkLoginService';
 import { emitEvent } from './telemetry';
 
 const PACKAGE_ID = process.env.EXPO_PUBLIC_PACKAGE_ID || '';
@@ -574,7 +574,7 @@ export const processAutoAccepts = async (
       }, myOwner, `accept_fired:${proposal.id.slice(0, 16)}`);
 
       const acceptTx = buildAcceptProposalTx(proposal.id, myTwinId);
-      await executeZkLoginTransaction(acceptTx, myOwner, jwt);
+      await executeSponsoredZkLoginTransaction(acceptTx, myOwner, jwt);
 
       // Guard key set AFTER success — allows retry on transient failures
       await AsyncStorage.setItem(guardKey, `accepted:${new Date().toISOString()}`);

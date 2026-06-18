@@ -22,7 +22,7 @@ import * as WebBrowser from 'expo-web-browser';
 import * as AuthSession from 'expo-auth-session';
 import { getZkLoginSignature, generateNonce } from '@mysten/sui/zklogin';
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
-import { executeSponsoredZkLogin } from '@/utils/shinamiSponsor';
+import { toBase64, fromBase64 } from '@mysten/sui/utils';
 import { buildSendHumanMessageTx } from '@/utils/suiTransactions';
 import { fetchJsonFromWalrus, uploadJsonToWalrus } from '@/utils/walrusService';
 import { getJwtForTransaction, loadZkLoginParams, setupZkLoginParams, fetchZkProof } from '@/utils/zkLoginService';
@@ -119,9 +119,39 @@ const getJwtForChatAction = async () => {
 };
 
 const executeWithZkLoginSession = async (tx: any, session: ChatZkSession) => {
-  return executeSponsoredZkLogin(
-    tx, session.userAddress, session.ephemeralKeyPair, session.zkProof, session.addressSeed, session.maxEpoch, suiClient
-  );
+  tx.setSender(session.userAddress);
+  const txBytesUint8 = await tx.build({ client: suiClient, onlyTransactionKind: true });
+
+  const sponsorRes = await fetch('/api/sponsor', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      txBytes: toBase64(txBytesUint8),
+      sender: session.userAddress,
+    })
+  });
+
+  if (!sponsorRes.ok) {
+    const text = await sponsorRes.text();
+    throw new Error(`Sponsor API failed: ${text}`);
+  }
+
+  const { txBytes, signature: sponsorSignature } = await sponsorRes.json();
+  const sponsoredTxBytesUint8 = fromBase64(txBytes);
+
+  const { signature: userSignature } = await session.ephemeralKeyPair.signTransaction(sponsoredTxBytesUint8);
+
+  const zkSignature = getZkLoginSignature({
+    inputs: { ...session.zkProof, addressSeed: session.addressSeed },
+    maxEpoch: session.maxEpoch,
+    userSignature,
+  });
+
+  return suiClient.executeTransactionBlock({
+    transactionBlock: sponsoredTxBytesUint8,
+    signature: [zkSignature, sponsorSignature],
+    options: { showEffects: true, showEvents: true, showObjectChanges: true },
+  });
 };
 
 const loadChainMessages = async (

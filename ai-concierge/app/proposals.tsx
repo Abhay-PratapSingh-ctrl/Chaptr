@@ -21,7 +21,7 @@ import {
 } from '@/utils/suiTransactions';
 import {
   getJwtForTransaction,
-  executeZkLoginTransaction,
+  executeSponsoredZkLoginTransaction,
 } from '@/utils/zkLoginService';
 import { processAutoAccepts } from '@/utils/matchSync';
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
@@ -191,14 +191,14 @@ const queryProposalEvents = async () => {
 
 // ── executeWithZkLogin ────────────────────────────────────────────────────────
 // Thin wrapper that delegates to the shared zkLoginService helpers.
-// getJwtForTransaction + executeZkLoginTransaction now live in zkLoginService
+// getJwtForTransaction + executeSponsoredZkLoginTransaction now live in zkLoginService
 // so matchSync (processAutoAccepts) can import them without a circular dep.
 const executeWithZkLogin = async (tx: any) => {
   const myOwner = await AsyncStorage.getItem('chaptr:my-owner');
   if (!myOwner) throw new Error("No local owner — create your Twin first.");
 
   const jwt = await getJwtForTransaction();
-  return executeZkLoginTransaction(tx, myOwner, jwt);
+  return executeSponsoredZkLoginTransaction(tx, myOwner, jwt);
 };
 
 const getInitial = (name: string) => (name ?? '?').charAt(0).toUpperCase();

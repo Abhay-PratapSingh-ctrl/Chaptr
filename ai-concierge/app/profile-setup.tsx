@@ -19,11 +19,8 @@ import * as WebBrowser from 'expo-web-browser';
 import * as ImagePicker from 'expo-image-picker';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { mintDigitalTwin } from '@/utils/suiTransactions';
-import { getJwtForTransaction, setupZkLoginParams, fetchZkProof, getEnokiEphemeralPublicKey, loadZkLoginParams } from '@/utils/zkLoginService';
-import { executeSponsoredZkLogin } from '@/utils/shinamiSponsor';
+import { getJwtForTransaction, setupZkLoginParams, fetchZkProof, getEnokiEphemeralPublicKey, loadZkLoginParams, executeSponsoredZkLoginTransaction } from '@/utils/zkLoginService';
 import { Transaction } from '@mysten/sui/transactions';
-import { getZkLoginSignature } from '@mysten/sui/zklogin';
-import { getFaucetHost, requestSuiFromFaucetV0 } from '@mysten/sui/faucet';
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
 import {
   buildProfileMemoryFacts,
@@ -209,21 +206,6 @@ export default function ProfileSetupScreen() {
     return await getJwtForTransaction(true);
   };
 
-  const autoFundIfNeeded = async (userAddress: string) => {
-    try {
-      console.log('Requesting testnet SUI from faucet for', userAddress);
-      setStatusMsg('Requesting free testnet SUI from faucet...');
-      await requestSuiFromFaucetV0({
-        host: getFaucetHost('testnet'),
-        recipient: userAddress,
-      });
-      console.log('Faucet success. Waiting 3s for network sync...');
-      await new Promise(resolve => setTimeout(resolve, 3000));
-    } catch (e) {
-      console.warn('Faucet failed:', e);
-      // Let it continue, maybe they already have SUI
-    }
-  };
 
   const handleMint = async (jwt: string) => {
     if (!vectorBlobId) throw new Error('No vector blob found. Please restart onboarding.');
@@ -240,8 +222,7 @@ export default function ProfileSetupScreen() {
       randomness,
     );
 
-    console.log('Fund this zkLogin testnet address:', userAddress);
-    await autoFundIfNeeded(userAddress);
+    console.log('Using zkLogin address:', userAddress);
 
     let photoBlobIds: string[] = [];
 
@@ -343,20 +324,7 @@ export default function ProfileSetupScreen() {
       ],
     });
 
-    const txBytesUint8 = await tx.build({ client: suiClient });
-    const { signature: userSignature } = await ephemeralKeyPair.signTransaction(txBytesUint8);
-
-    const zkSignature = getZkLoginSignature({
-      inputs: { ...zkProof, addressSeed },
-      maxEpoch,
-      userSignature,
-    });
-
-    const result = await suiClient.executeTransactionBlock({
-      transactionBlock: txBytesUint8,
-      signature: zkSignature,
-      options: { showEffects: true, showEvents: true, showObjectChanges: true },
-    });
+    const result = await executeSponsoredZkLoginTransaction(tx, userAddress, jwt);
 
     const objectChanges = (result as any).objectChanges;
     const twinObjectId = extractCreatedTwinId(objectChanges);
@@ -429,8 +397,8 @@ export default function ProfileSetupScreen() {
         ],
       });
 
-      const result = await executeSponsoredZkLogin(
-        tx, userAddress, ephemeralKeyPair, zkProof, addressSeed, maxEpoch, suiClient
+      const result = await executeSponsoredZkLoginTransaction(
+        tx, userAddress, jwt
       );
 
       console.log('Re-register digest:', result.digest);

@@ -26,7 +26,7 @@ import {
   loadZkLoginParams,
   setupZkLoginParams,
   getJwtForTransaction,
-  executeZkLoginTransaction,
+  executeSponsoredZkLoginTransaction,
 } from '@/utils/zkLoginService';
 import { emitEvent } from '@/utils/telemetry';
 import {
@@ -370,7 +370,7 @@ const syncActiveProposalAcceptance = async (
 
 // getJwtForTransaction — imported from zkLoginService
 
-// executeZkLoginTransaction — imported from zkLoginService
+// executeSponsoredZkLoginTransaction — imported from zkLoginService
 
 const cleanPhrase = (value?: string | null) =>
   (value ?? '').trim().replace(/[.!?]+$/g, '').toLowerCase();
@@ -1244,7 +1244,7 @@ export default function MorningBriefingScreen() {
       // CRITICAL FIX for Enoki 429 / popup-on-every-navigation bug:
       setLoadingPhase('Your Twin is making decisions…');
       //
-      // We intentionally skip 'record' actions here. Each executeZkLoginTransaction
+      // We intentionally skip 'record' actions here. Each executeSponsoredZkLoginTransaction
       // call costs one Enoki ZK proof generation. The free tier limit is tight —
       // with 2 candidates, firing both record + propose = 4 proofs per scan.
       // Skipping record cuts that to 1 proof per candidate (only the propose).
@@ -1340,7 +1340,7 @@ export default function MorningBriefingScreen() {
                 action.entryOwner,
                 `Your Twin scored ${action.score}% in an A2A conversation. No human was involved.`,
               );
-              const txResult = await executeZkLoginTransaction(ptb, myOwner, phaseJwt);
+              const txResult = await executeSponsoredZkLoginTransaction(ptb, myOwner, phaseJwt);
               await AsyncStorage.setItem(
                 `chaptr:auto-proposed:${action.entryOwner.toLowerCase()}`,
                 new Date().toISOString(),
@@ -1373,7 +1373,7 @@ export default function MorningBriefingScreen() {
                   action.reportRef,
                   action.score,
                 );
-                await executeZkLoginTransaction(recordTx, myOwner, phaseJwt);
+                await executeSponsoredZkLoginTransaction(recordTx, myOwner, phaseJwt);
                 console.log('[PTB] Fallback record-only succeeded for', action.entryOwner.slice(0, 10));
               } catch (recordErr) {
                 console.warn('[PTB] Fallback record also failed (non-blocking):', recordErr);
@@ -1515,7 +1515,7 @@ export default function MorningBriefingScreen() {
       if (!proposalId) throw new Error('Could not find the proposal object ID.');
       const jwt = await getJwtForTransaction();
       const tx = buildWithdrawProposalTx(proposalId);
-      await executeZkLoginTransaction(tx, myOwner, jwt);
+      await executeSponsoredZkLoginTransaction(tx, myOwner, jwt);
       await AsyncStorage.removeItem(ACTIVE_PROPOSAL_KEY);
       setActiveProposal(null);
       showNotice('Proposal withdrawn', 'Your Twin is free to focus on someone new.');

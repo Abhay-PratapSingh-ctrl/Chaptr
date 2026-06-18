@@ -15,10 +15,9 @@ import * as WebBrowser from 'expo-web-browser';
 import * as AuthSession from 'expo-auth-session';
 import { getZkLoginSignature, generateNonce } from '@mysten/sui/zklogin';
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
-import { executeSponsoredZkLogin } from '@/utils/shinamiSponsor';
+import { getJwtForTransaction, executeSponsoredZkLoginTransaction } from '@/utils/zkLoginService';
 import { buildEndMatchTx } from '@/utils/suiTransactions';
 import { writeFeedback, submitReport, writeBlockEntry } from '@/utils/safetyService';
-import { fetchZkProof, getJwtForTransaction, loadZkLoginParams, setupZkLoginParams } from '@/utils/zkLoginService';
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -82,22 +81,8 @@ const getJwtForEndMatch = async () => {
 
 // Accepts jwt as parameter — called after local writes so popup isn't blocked
 const executeEndMatch = async (matchId: string, expectedOwner: string, jwt: string) => {
-  const { ephemeralKeyPair, maxEpoch, randomness } = await loadZkLoginParams();
-  const { zkProof, addressSeed, userAddress } = await fetchZkProof(
-    jwt,
-    ephemeralKeyPair,
-    maxEpoch,
-    randomness,
-  );
-
-  if (userAddress.toLowerCase() !== expectedOwner.toLowerCase()) {
-    throw new Error("Selected Google account does not match this browser's Chaptr identity.");
-  }
-
   const tx = buildEndMatchTx(matchId);
-  return executeSponsoredZkLogin(
-    tx, userAddress, ephemeralKeyPair, zkProof, addressSeed, maxEpoch, suiClient
-  );
+  return executeSponsoredZkLoginTransaction(tx, expectedOwner, jwt);
 };
 
 const cleanupEndedMatch = async (input: {
