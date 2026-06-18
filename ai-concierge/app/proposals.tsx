@@ -453,15 +453,18 @@ export default function ProposalsScreen() {
       setActionId(proposal.proposalId);
 
       const tx = buildRejectProposalTx(proposal.proposalId);
-      const result = await executeWithZkLogin(tx);
+      try {
+        const result = await executeWithZkLogin(tx);
+        Alert.alert(
+          'Proposal rejected',
+          `Their Twin has been released.\n\nTx: ${result.digest.slice(0, 18)}...`,
+        );
+      } catch (onChainErr: any) {
+        console.warn('On-chain reject failed (likely already deleted):', onChainErr);
+        // We do not throw here. We still want to hide it locally.
+      }
 
       await writeUniqueString(HIDDEN_PROPOSALS_KEY, proposal.proposalId);
-
-      Alert.alert(
-        'Proposal rejected',
-        `Their Twin has been released.\n\nTx: ${result.digest.slice(0, 18)}...`,
-      );
-
       loadProposals().catch(console.warn);
     } catch (err: any) {
       console.error('Reject failed:', err);
@@ -527,7 +530,14 @@ export default function ProposalsScreen() {
       setWithdrawId(proposal.proposalId);
       const { buildWithdrawProposalTx } = await import('@/utils/suiTransactions');
       const tx = buildWithdrawProposalTx(proposal.proposalId);
-      const result = await executeWithZkLogin(tx);
+      
+      try {
+        const result = await executeWithZkLogin(tx);
+        Alert.alert('Withdrawn', `Your Twin is free again.\nTx: ${result.digest.slice(0, 18)}...`);
+      } catch (onChainErr: any) {
+        console.warn('On-chain withdraw failed (likely already deleted):', onChainErr);
+        // Do not throw. Clear it locally.
+      }
 
       // Clear the auto-proposed guard so this person can be proposed to again
       await AsyncStorage.removeItem(
@@ -537,14 +547,59 @@ export default function ProposalsScreen() {
       setOutgoingProposals(prev =>
         prev.filter(p => p.proposalId !== proposal.proposalId)
       );
-
-      Alert.alert('Withdrawn', `Your Twin is free again.\nTx: ${result.digest.slice(0, 18)}...`);
     } catch (err: any) {
       Alert.alert('Withdraw failed', err.message ?? 'Could not withdraw.');
     } finally {
       setWithdrawId(null);
     }
   };
+  const handleWipeAll = async () => {
+    Alert.alert(
+      'Wipe All Proposals?',
+      'This will irreversibly withdraw all your outgoing proposals and reject all incoming proposals on the blockchain.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { 
+          text: 'Wipe Everything', 
+          style: 'destructive',
+          onPress: async () => {
+            setIsLoading(true);
+            try {
+              const { buildWithdrawProposalTx, buildRejectProposalTx } = await import('@/utils/suiTransactions');
+              
+              // Withdraw all outgoing
+              for (const p of outgoingProposals) {
+                try {
+                  const tx = buildWithdrawProposalTx(p.proposalId);
+                  await executeWithZkLogin(tx).catch(e => console.warn('Already withdrawn:', e.message));
+                } finally {
+                  await AsyncStorage.removeItem(`chaptr:auto-proposed:${p.to.toLowerCase()}`);
+                }
+              }
+              
+              // Reject all incoming
+              for (const p of proposals) {
+                try {
+                  const tx = buildRejectProposalTx(p.proposalId);
+                  await executeWithZkLogin(tx).catch(e => console.warn('Already rejected:', e.message));
+                } finally {
+                  await writeUniqueString(HIDDEN_PROPOSALS_KEY, p.proposalId);
+                }
+              }
+              
+              Alert.alert('Slate Cleaned', 'All proposals have been successfully wiped from the blockchain.');
+              loadProposals();
+            } catch (err: any) {
+              Alert.alert('Wipe Error', err.message);
+            } finally {
+              setIsLoading(false);
+            }
+          }
+        }
+      ]
+    );
+  };
+
 
   if (isLoading) {
     return (
@@ -560,12 +615,15 @@ export default function ProposalsScreen() {
   return (
     <SafeAreaView style={styles.root}>
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => router.back()} style={styles.backButton}>
+        <TouchableOpacity onPress={() => router.canGoBack() ? router.back() : router.replace('/')} style={styles.backButton}>
           <Text style={styles.backText}>{'< Back'}</Text>
         </TouchableOpacity>
 
         <Text style={styles.headerTitle}>Proposals</Text>
 
+        <TouchableOpacity onPress={handleWipeAll} style={[styles.refreshButton, { backgroundColor: 'rgba(248,113,113,0.1)', borderColor: 'rgba(248,113,113,0.3)', marginRight: 8 }]}>
+          <Text style={[styles.refreshText, { color: '#f87171' }]}>WIPE ALL</Text>
+        </TouchableOpacity>
         <TouchableOpacity onPress={loadProposals} style={styles.refreshButton}>
           <Text style={styles.refreshText}>Refresh</Text>
         </TouchableOpacity>

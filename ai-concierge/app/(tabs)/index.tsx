@@ -14,6 +14,7 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+import Animated, { FadeInUp, Layout } from 'react-native-reanimated';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { LinearGradient } from 'expo-linear-gradient';
 import { router, useFocusEffect, type Href } from 'expo-router';
@@ -918,6 +919,11 @@ export default function MorningBriefingScreen() {
         myOwner && activeMatchedOwners.has(myOwner.toLowerCase()),
       );
 
+      emitEvent('pool_scan_start', {
+        poolSize: entries.length,
+        isInActiveMatch,
+      }, myOwner ?? '', `pool_scan:${Date.now()}`);
+
       let mandateFields: any = null;
       if (mandateIdStored && !isInActiveMatch) {
         try {
@@ -926,6 +932,12 @@ export default function MorningBriefingScreen() {
             options: { showContent: true },
           });
           mandateFields = (mandateObj.data?.content as any)?.fields ?? null;
+
+          emitEvent('mandate_check', {
+            context: 'morning_briefing',
+            allowed: mandateFields?.may_propose === true,
+            minScoreToAccept: Number(mandateFields?.min_score_to_propose ?? 80),
+          }, myOwner ?? '', `mandate_check:briefing:${myOwner?.slice(0, 8)}`);
         } catch (err) {
           console.warn('[A2A] Mandate fetch failed (non-blocking):', err);
         }
@@ -1012,6 +1024,11 @@ export default function MorningBriefingScreen() {
       // Groq rate limits are never hit. Cache is checked first — if a result
       // exists from a prior session it is returned instantly with no API call.
       setLoadingPhase('Running compatibility analysis…');
+
+      emitEvent('a2a_phase_start', {
+        candidatesCount: scoutedEntries.length,
+        mandateAllows: mandateFields?.may_run_a2a === true,
+      }, myOwner ?? '', `a2a_phase_start:${Date.now()}`);
 
       // FIX: split propose actions from record actions so Phase 4 can skip
       // record_a2a_result entirely, cutting Enoki proof generation in half.
@@ -1210,15 +1227,15 @@ export default function MorningBriefingScreen() {
       
       if (myOwner && !isInActiveMatch && mandateFields?.may_propose === true) {
         try {
-          setIsLoading(false);
-          setIsAwaitingAuth(true);
-          phaseJwt = await getJwtForTransaction();
-          setIsAwaitingAuth(false);
+          // Do not preemptively ask for JWT here! That causes endless popups on every load.
+          // Let processAutoAccepts lazily request the JWT only if it finds pending proposals.
+          
           setIsLoading(true);
-          console.log('[Pre-Phase4] JWT obtained — running auto-accept before outbound proposals');
-
-          // Run auto-accept synchronously so we know if the Twin was consumed
-          const autoAcceptResult = await processAutoAccepts(myOwner, phaseJwt);
+          const autoAcceptResult = await processAutoAccepts(myOwner);
+          
+          // If it successfully acquired a JWT internally (because it accepted a proposal),
+          // we don't have a way to pass it back to Phase 4 cleanly right now, but Phase 4 
+          // won't run anyway because twinConsumedByAccept = true.
           
           if (autoAcceptResult?.accepted) {
             console.log('[Pre-Phase4] Twin consumed by auto-accept — updating UI and skipping outbound proposals');
@@ -1529,7 +1546,11 @@ export default function MorningBriefingScreen() {
     const scoreColor = item.compatibility >= 85 ? '#4ade80' : item.compatibility >= 70 ? '#D94A8C' : '#A299A8';
 
     return (
-      <View style={[styles.card, isTopCard && styles.focusCard]}>
+      <Animated.View 
+        entering={FadeInUp.delay(index * 120).springify().damping(14).mass(0.8)} 
+        layout={Layout.springify()} 
+        style={[styles.card, isTopCard && styles.focusCard]}
+      >
         <LinearGradient
           colors={isTopCard ? ['rgba(217,74,140,0.18)', 'rgba(122,62,184,0.10)', 'rgba(13,11,16,0.98)'] : ['rgba(30,24,38,0.95)', 'rgba(13,11,16,0.98)']}
           start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }}
@@ -1634,7 +1655,7 @@ export default function MorningBriefingScreen() {
             </>
           )}
         </LinearGradient>
-      </View>
+      </Animated.View>
     );
   };
 
@@ -1706,11 +1727,21 @@ export default function MorningBriefingScreen() {
           </View>
         )}
 
+        {/* Loading Banner (Non-blocking background sync) */}
+        {isLoading && !isAwaitingAuth && (
+          <View style={[styles.authBanner, { backgroundColor: 'rgba(217,74,140,0.1)', borderColor: 'rgba(217,74,140,0.3)' }]}>
+            <ActivityIndicator color="#D94A8C" size="small" style={{ marginRight: 8 }} />
+            <Text style={[styles.authBannerText, { color: '#D94A8C' }]}>
+              {loadingText || 'Analyzing Pool...'}
+            </Text>
+          </View>
+        )}
+
         {/* Active Human Match Banner */}
         {activeHumanMatch ? (
           <View style={styles.matchBannerOuter}>
             <LinearGradient
-              colors={['rgba(74,222,128,0.14)', 'rgba(217,74,140,0.10)', 'rgba(18,15,24,0.97)']}
+              colors={['rgba(74,222,128,0.14)', 'rgba(217,74,140,0.10)', 'rgba(13,11,16,0.97)']}
               start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }}
               style={styles.matchBannerGradient}
             >
@@ -1882,84 +1913,84 @@ const styles = StyleSheet.create({
   noSessionContainer: { flex: 1, maxWidth: 520, alignSelf: 'center', justifyContent: 'center', paddingHorizontal: 28 },
   noSessionTitle: { color: '#FDFBF7', fontSize: 28, fontWeight: '900', textAlign: 'center', marginBottom: 10 },
   noSessionBody: { color: '#A299A8', fontSize: 15, lineHeight: 22, textAlign: 'center', marginBottom: 28 },
-  primaryButtonWrap: { height: 52, borderRadius: 18, overflow: 'hidden' },
+  primaryButtonWrap: { height: 56, borderRadius: 20, overflow: 'hidden', shadowColor: '#D94A8C', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.35, shadowRadius: 14, elevation: 8 },
   primaryButtonGradient: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   primaryButtonText: { color: '#FFF', fontSize: 16, fontWeight: '800' },
   container: { flex: 1, maxWidth: 620, alignSelf: 'center', width: '100%', paddingHorizontal: 16, paddingTop: 12 },
   headerRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16, gap: 12 },
-  logoText: { color: '#FDFBF7', fontSize: 22, fontWeight: '800', fontFamily: Platform.OS === 'ios' ? 'Georgia' : 'serif', letterSpacing: 0.4 },
+  logoText: { color: '#FDFBF7', fontSize: 22, fontWeight: '800', fontFamily: Platform.OS === 'ios' ? 'Playfair Display' : 'serif', letterSpacing: 0.4 },
   headerActions: { flexDirection: 'row', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' },
-  pillButton: { borderWidth: 1, borderColor: '#2A2432', backgroundColor: '#16131A', borderRadius: 999, paddingHorizontal: 13, paddingVertical: 7 },
+  pillButton: { borderWidth: 1, borderColor: 'rgba(255,255,255,0.08)', backgroundColor: '#17171A', borderRadius: 999, paddingHorizontal: 13, paddingVertical: 7 },
   pillButtonText: { color: '#A299A8', fontSize: 12, fontWeight: '700' },
   pillButtonActivity: { borderColor: 'rgba(217,74,140,0.45)', backgroundColor: 'rgba(217,74,140,0.08)' },
   pillButtonActivityText: { color: '#E91E8C' },
   pillButtonDanger: { borderColor: 'rgba(248,113,113,0.35)' },
   pillButtonDangerText: { color: '#f87171' },
-  matchBannerOuter: { borderRadius: 22, overflow: 'hidden', borderWidth: 1, borderColor: 'rgba(74,222,128,0.38)', marginBottom: 18, shadowColor: '#4ade80', shadowOffset: { width: 0, height: 0 }, shadowOpacity: 0.18, shadowRadius: 16, elevation: 8 },
+  matchBannerOuter: { borderRadius: 24, overflow: 'hidden', borderWidth: 1, borderColor: 'rgba(74,222,128,0.38)', marginBottom: 18, shadowColor: '#4ade80', shadowOffset: { width: 0, height: 0 }, shadowOpacity: 0.18, shadowRadius: 20, elevation: 10 },
   matchBannerGradient: { padding: 18 },
   matchBannerTopRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 12 },
-  authBanner: { backgroundColor: 'rgba(217,74,140,0.1)', borderColor: 'rgba(217,74,140,0.3)', borderWidth: 1, paddingVertical: 12, paddingHorizontal: 16, borderRadius: 8, marginHorizontal: 16, marginBottom: 16, alignItems: 'center' },
+  authBanner: { backgroundColor: 'rgba(217,74,140,0.1)', borderColor: 'rgba(217,74,140,0.3)', borderWidth: 1, paddingVertical: 12, paddingHorizontal: 16, borderRadius: 14, marginHorizontal: 16, marginBottom: 16, alignItems: 'center' },
   authBannerText: { color: '#D94A8C', fontSize: 14, fontWeight: '600' },
   matchBannerKicker: { color: '#4ade80', fontSize: 11, fontWeight: '900', letterSpacing: 2 },
   livePill: { flexDirection: 'row', alignItems: 'center', gap: 5, borderWidth: 1, borderColor: 'rgba(74,222,128,0.5)', borderRadius: 999, paddingHorizontal: 10, paddingVertical: 4, backgroundColor: 'rgba(74,222,128,0.10)' },
   liveDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: '#4ade80' },
   livePillText: { color: '#4ade80', fontSize: 10, fontWeight: '900', letterSpacing: 1.5 },
   matchIdentityRow: { flexDirection: 'row', alignItems: 'center', gap: 14, marginBottom: 16 },
-  matchAvatar: { width: 52, height: 52, borderRadius: 26, backgroundColor: 'rgba(217,74,140,0.22)', borderWidth: 2, borderColor: 'rgba(217,74,140,0.55)', alignItems: 'center', justifyContent: 'center' },
+  matchAvatar: { width: 56, height: 56, borderRadius: 28, backgroundColor: 'rgba(217,74,140,0.22)', borderWidth: 2, borderColor: 'rgba(217,74,140,0.55)', alignItems: 'center', justifyContent: 'center' },
   matchAvatarInitial: { color: '#FDFBF7', fontSize: 22, fontWeight: '900' },
   matchIdentityText: { flex: 1 },
   matchBannerName: { color: '#FDFBF7', fontSize: 17, fontWeight: '800', lineHeight: 22, marginBottom: 8 },
   matchMetaRow: { flexDirection: 'row', gap: 8 },
-  metaPill: { borderRadius: 999, borderWidth: 1, borderColor: 'rgba(74,222,128,0.28)', backgroundColor: 'rgba(74,222,128,0.07)', paddingHorizontal: 9, paddingVertical: 3 },
+  metaPill: { borderRadius: 999, borderWidth: 1, borderColor: 'rgba(74,222,128,0.28)', backgroundColor: 'rgba(74,222,128,0.07)', paddingHorizontal: 10, paddingVertical: 4 },
   metaPillText: { color: '#a7f3d0', fontSize: 11, fontWeight: '700' },
   matchBannerActions: { flexDirection: 'row', gap: 10 },
-  matchChatButtonWrap: { flex: 2, height: 48, borderRadius: 16, overflow: 'hidden', shadowColor: '#D94A8C', shadowOffset: { width: 0, height: 0 }, shadowOpacity: 0.45, shadowRadius: 12, elevation: 6 },
+  matchChatButtonWrap: { flex: 2, height: 52, borderRadius: 18, overflow: 'hidden', shadowColor: '#D94A8C', shadowOffset: { width: 0, height: 0 }, shadowOpacity: 0.45, shadowRadius: 16, elevation: 8 },
   matchChatGradient: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   matchChatText: { color: '#FFF', fontSize: 14, fontWeight: '900', letterSpacing: 0.3 },
-  endMatchButton: { flex: 1, height: 48, borderRadius: 16, borderWidth: 1, borderColor: 'rgba(248,113,113,0.55)', backgroundColor: 'rgba(248,113,113,0.08)', alignItems: 'center', justifyContent: 'center' },
+  endMatchButton: { flex: 1, height: 52, borderRadius: 18, borderWidth: 1, borderColor: 'rgba(248,113,113,0.55)', backgroundColor: 'rgba(248,113,113,0.08)', alignItems: 'center', justifyContent: 'center' },
   endMatchText: { color: '#fca5a5', fontSize: 13, fontWeight: '900' },
-  focusBannerOuter: { borderRadius: 20, overflow: 'hidden', borderWidth: 1, borderColor: 'rgba(74,222,128,0.32)', marginBottom: 18 },
-  focusBannerGradient: { padding: 16 },
+  focusBannerOuter: { borderRadius: 24, overflow: 'hidden', borderWidth: 1, borderColor: 'rgba(74,222,128,0.32)', marginBottom: 18 },
+  focusBannerGradient: { padding: 18 },
   focusTopRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 },
   focusKicker: { color: '#4ade80', fontSize: 11, fontWeight: '900', letterSpacing: 2 },
-  focusBadge: { borderRadius: 999, borderWidth: 1, borderColor: 'rgba(74,222,128,0.35)', paddingHorizontal: 9, paddingVertical: 3, backgroundColor: 'rgba(74,222,128,0.08)' },
+  focusBadge: { borderRadius: 999, borderWidth: 1, borderColor: 'rgba(74,222,128,0.35)', paddingHorizontal: 10, paddingVertical: 4, backgroundColor: 'rgba(74,222,128,0.08)' },
   focusBadgeText: { color: '#a7f3d0', fontSize: 11, fontWeight: '700' },
   focusTitle: { color: '#FDFBF7', fontSize: 16, fontWeight: '800', marginBottom: 4 },
   focusBody: { color: '#8DA89A', fontSize: 12, lineHeight: 17, marginBottom: 12 },
   focusActions: { flexDirection: 'row', gap: 10 },
-  focusActionPrimary: { flex: 1, height: 42, borderRadius: 13, borderWidth: 1, borderColor: 'rgba(74,222,128,0.42)', alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(74,222,128,0.08)' },
+  focusActionPrimary: { flex: 1, height: 46, borderRadius: 16, borderWidth: 1, borderColor: 'rgba(74,222,128,0.42)', alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(74,222,128,0.08)' },
   focusActionPrimaryText: { color: '#d1fae5', fontSize: 13, fontWeight: '800' },
-  focusActionSecondary: { flex: 1, height: 42, borderRadius: 13, borderWidth: 1, borderColor: 'rgba(248,113,113,0.45)', alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(248,113,113,0.08)' },
+  focusActionSecondary: { flex: 1, height: 46, borderRadius: 16, borderWidth: 1, borderColor: 'rgba(248,113,113,0.45)', alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(248,113,113,0.08)' },
   focusActionSecondaryText: { color: '#fecaca', fontSize: 13, fontWeight: '800' },
   briefingHeaderRow: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 14, gap: 10 },
-  briefingTitle: { color: '#FDFBF7', fontSize: 24, fontWeight: '800' },
+  briefingTitle: { color: '#FDFBF7', fontSize: 24, fontWeight: '800', fontFamily: Platform.OS === 'ios' ? 'Playfair Display' : 'serif' },
   briefingSubtitle: { color: '#A299A8', fontSize: 13, lineHeight: 19, marginTop: 4, maxWidth: 300 },
   briefingClock: { color: '#D94A8C', fontSize: 13, fontWeight: '700', letterSpacing: 0.8, marginTop: 4 },
   errorText: { color: '#D94A8C', fontSize: 13, textAlign: 'center', marginBottom: 10 },
   listContent: { paddingBottom: 32, gap: 14 },
-  card: { borderRadius: 22, overflow: 'hidden', borderWidth: 1, borderColor: '#231E2C' },
-  focusCard: { borderColor: 'rgba(217,74,140,0.48)', shadowColor: '#D94A8C', shadowOffset: { width: 0, height: 0 }, shadowOpacity: 0.22, shadowRadius: 18, elevation: 8 },
+  card: { borderRadius: 24, overflow: 'hidden', borderWidth: 1, borderColor: 'rgba(255,255,255,0.06)' },
+  focusCard: { borderColor: 'rgba(217,74,140,0.55)', shadowColor: '#D94A8C', shadowOffset: { width: 0, height: 0 }, shadowOpacity: 0.4, shadowRadius: 28, elevation: 14 },
   cardGradient: { padding: 16 },
   cardHeader: { flexDirection: 'row', alignItems: 'flex-start', gap: 12 },
-  avatar: { width: 68, height: 80, borderRadius: 18, overflow: 'hidden', backgroundColor: '#2A2432', borderWidth: 1, borderColor: 'rgba(217,74,140,0.32)' },
+  avatar: { width: 68, height: 80, borderRadius: 20, overflow: 'hidden', backgroundColor: '#2A2432', borderWidth: 1, borderColor: 'rgba(217,74,140,0.32)' },
   avatarImage: { width: '100%', height: '100%' },
   lockOverlay: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(13,11,16,0.45)', alignItems: 'center', justifyContent: 'center' },
   lockIcon: { fontSize: 20 },
   profileInfo: { flex: 1, minWidth: 0 },
   nameRow: { flexDirection: 'row', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
-  profileName: { color: '#FDFBF7', fontSize: 18, fontWeight: '800' },
-  zkBadge: { borderWidth: 1, borderColor: '#4ade80', backgroundColor: 'rgba(74,222,128,0.10)', borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2 },
+  profileName: { color: '#FDFBF7', fontSize: 18, fontWeight: '800', fontFamily: Platform.OS === 'ios' ? 'Georgia' : 'serif' },
+  zkBadge: { borderWidth: 1, borderColor: '#4ade80', backgroundColor: 'rgba(74,222,128,0.10)', borderRadius: 8, paddingHorizontal: 7, paddingVertical: 3 },
   zkBadgeText: { color: '#4ade80', fontSize: 10, fontWeight: '800' },
   location: { color: '#7A7085', fontSize: 12, marginTop: 4 },
   bio: { color: '#C8C0CE', fontSize: 13, lineHeight: 18, marginTop: 5 },
   statusHint: { fontSize: 12, marginTop: 7, fontWeight: '700' },
   hintGreen: { color: '#4ade80' },
   hintMuted: { color: '#55505e' },
-  scorePill: { alignItems: 'center', borderRadius: 14, paddingHorizontal: 10, paddingVertical: 8, backgroundColor: 'rgba(255,255,255,0.04)', borderWidth: 1 },
+  scorePill: { alignItems: 'center', borderRadius: 14, paddingHorizontal: 10, paddingVertical: 8, backgroundColor: 'rgba(255,255,255,0.03)', borderWidth: 1 },
   scoreValue: { fontSize: 15, fontWeight: '900' },
   scoreLabel: { color: '#A299A8', fontSize: 10, marginTop: 1 },
   divider: { height: 1, backgroundColor: 'rgba(255,255,255,0.06)', marginVertical: 14 },
-  reportBox: { borderRadius: 16, borderWidth: 1, borderColor: 'rgba(217,74,140,0.28)', backgroundColor: 'rgba(217,74,140,0.06)', padding: 14, gap: 8 },
+  reportBox: { borderRadius: 18, borderWidth: 1, borderColor: 'rgba(217,74,140,0.28)', backgroundColor: 'rgba(217,74,140,0.06)', padding: 16, gap: 10 },
   reportTitle: { color: '#FDFBF7', fontSize: 12, fontWeight: '800', marginBottom: 2 },
   reportLine: { borderRadius: 12, paddingHorizontal: 10, paddingVertical: 8, backgroundColor: 'rgba(13,11,16,0.55)', flexDirection: 'row', flexWrap: 'wrap' },
   reportLineRisk: { borderWidth: 1, borderColor: 'rgba(248,113,113,0.2)' },
@@ -1969,15 +2000,15 @@ const styles = StyleSheet.create({
   reportFeedbackBox: { borderTopWidth: 1, borderTopColor: 'rgba(255,255,255,0.06)', marginTop: 10, paddingTop: 10 },
   reportFeedbackTitle: { color: '#A299A8', fontSize: 12, fontWeight: '800', marginBottom: 8 },
   reportFeedbackActions: { flexDirection: 'row', gap: 8 },
-  reportFeedbackButton: { flex: 1, minHeight: 36, borderRadius: 12, borderWidth: 1, borderColor: 'rgba(217,74,140,0.34)', backgroundColor: 'rgba(217,74,140,0.08)', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 8 },
+  reportFeedbackButton: { flex: 1, minHeight: 40, borderRadius: 14, borderWidth: 1, borderColor: 'rgba(217,74,140,0.34)', backgroundColor: 'rgba(217,74,140,0.08)', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 10 },
   reportFeedbackButtonDisabled: { opacity: 0.55 },
   reportFeedbackButtonText: { color: '#f9a8d4', fontSize: 11, fontWeight: '900' },
   reportFeedbackDone: { color: '#4ade80', fontSize: 12, fontWeight: '900' },
   refText: { color: '#4A4356', fontSize: 11, marginTop: 10, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
   actionRow: { marginTop: 14, gap: 10 },
-  passButton: { height: 46, borderRadius: 15, borderWidth: 1, borderColor: '#302840', alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,255,255,0.03)' },
+  passButton: { height: 50, borderRadius: 18, borderWidth: 1, borderColor: '#302840', alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,255,255,0.04)' },
   passButtonText: { color: '#C0B8C8', fontSize: 14, fontWeight: '700' },
-  chatButtonWrap: { height: 50, borderRadius: 16, overflow: 'hidden' },
+  chatButtonWrap: { height: 54, borderRadius: 20, overflow: 'hidden', shadowColor: '#D94A8C', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.35, shadowRadius: 14, elevation: 8 },
   chatButtonGradient: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   chatButtonText: { color: '#FFF', fontSize: 15, fontWeight: '800' },
   emptyState: { marginTop: 60, alignItems: 'center', paddingHorizontal: 24 },

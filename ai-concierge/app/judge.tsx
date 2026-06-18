@@ -408,14 +408,17 @@ export default function JudgeDashboard() {
     setEvents([]);
   }, []);
 
-  const handleClearCache = useCallback(async () => {
+  const handleClearDemoState = useCallback(async () => {
     try {
       const keys = await AsyncStorage.getAllKeys();
-      const cacheKeys = keys.filter(k => k.startsWith('chaptr:a2a-result:'));
-      await AsyncStorage.multiRemove(cacheKeys);
-      alert(`Cleared ${cacheKeys.length} cached A2A conversations.`);
+      const stateKeys = keys.filter(k => 
+        k.startsWith('chaptr:auto-proposed:') ||
+        k.startsWith('chaptr:auto-accepted:')
+      );
+      await AsyncStorage.multiRemove(stateKeys);
+      alert(`Cleared ${stateKeys.length} guard keys. LLM caches were NOT deleted!`);
     } catch (e) {
-      console.warn('Failed to clear A2A cache:', e);
+      console.warn('Failed to clear demo state:', e);
     }
   }, []);
 
@@ -425,7 +428,7 @@ export default function JudgeDashboard() {
         {/* Header */}
         <View style={styles.header}>
           <View style={styles.headerLeft}>
-            <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}>
+            <TouchableOpacity onPress={() => router.canGoBack() ? router.back() : router.replace('/')} style={styles.backBtn}>
               <Text style={styles.backBtnText}>← Back</Text>
             </TouchableOpacity>
             <Text style={styles.title}>🏛 Judge Dashboard</Text>
@@ -440,8 +443,8 @@ export default function JudgeDashboard() {
                 {isLive ? 'LIVE' : 'PAUSED'}
               </Text>
             </TouchableOpacity>
-            <TouchableOpacity style={[styles.clearBtn, { borderColor: 'rgba(96,165,250,0.3)', backgroundColor: 'rgba(96,165,250,0.1)' }]} onPress={handleClearCache}>
-              <Text style={[styles.clearBtnText, { color: '#60a5fa' }]}>Clear Cache</Text>
+            <TouchableOpacity style={[styles.clearBtn, { borderColor: 'rgba(96,165,250,0.3)', backgroundColor: 'rgba(96,165,250,0.1)' }]} onPress={handleClearDemoState}>
+              <Text style={[styles.clearBtnText, { color: '#60a5fa' }]}>Clear Demo State</Text>
             </TouchableOpacity>
             <TouchableOpacity style={styles.clearBtn} onPress={handleClear}>
               <Text style={styles.clearBtnText}>Clear Telemetry</Text>

@@ -161,12 +161,21 @@ const cleanupEndedMatch = async (input: {
   const parsed = raw ? JSON.parse(raw) : [];
   const matches = Array.isArray(parsed) ? parsed : [];
   // Remove participant's twin ID from unlocked profiles on match end
-const unlockedRaw = await AsyncStorage.getItem('chaptr:unlocked-profiles');
-const unlocked = unlockedRaw ? JSON.parse(unlockedRaw) : [];
-const filtered = unlocked.filter((id: string) => 
-  id.toLowerCase() !== input.targetTwinId.toLowerCase()
-);
-await AsyncStorage.setItem('chaptr:unlocked-profiles', JSON.stringify(filtered));
+  const unlockedRaw = await AsyncStorage.getItem('chaptr:unlocked-profiles');
+  const unlocked = unlockedRaw ? JSON.parse(unlockedRaw) : [];
+  const filtered = unlocked.filter((id: string) => 
+    id.toLowerCase() !== input.targetTwinId.toLowerCase()
+  );
+  await AsyncStorage.setItem('chaptr:unlocked-profiles', JSON.stringify(filtered));
+
+  // ── Remove Agentic Guard Keys ──
+  // This allows the AI to propose or accept proposals from this user again in the future
+  if (input.targetOwner) {
+    await AsyncStorage.removeItem(`chaptr:auto-proposed:${input.targetOwner.toLowerCase()}`);
+  }
+  if (input.proposalId) {
+    await AsyncStorage.removeItem(`chaptr:auto-accepted:${input.proposalId.toLowerCase()}`);
+  }
 
   const next = matches.filter((match) => {
     const matchKeys = [
