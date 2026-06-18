@@ -25,13 +25,17 @@ export const executeSponsoredZkLogin = async (
   // Mobile devices don't have CORS, so they hit Shinami directly.
   const isWeb = Platform.OS === 'web';
   const isProduction = process.env.NODE_ENV === 'production';
+  // Do not append ?auth= here. The Shinami Gas API strictly requires X-API-Key header.
   const sponsorUrl = (isWeb && isProduction)
-    ? `/api/shinami-sponsor?auth=${shinamiKey}`
-    : `https://api.shinami.com/gas/v1/sui_testnet?auth=${shinamiKey}`;
+    ? '/api/shinami-sponsor'
+    : 'https://api.shinami.com/gas/v1/sui_testnet';
 
   const sponsorRes = await fetch(sponsorUrl, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 
+      'Content-Type': 'application/json',
+      'X-API-Key': shinamiKey
+    },
     body: JSON.stringify({
       jsonrpc: '2.0',
       id: 1,
@@ -39,6 +43,11 @@ export const executeSponsoredZkLogin = async (
       params: [txBytesBase64, userAddress, 10000000]
     })
   });
+
+  if (!sponsorRes.ok) {
+    const errorText = await sponsorRes.text();
+    throw new Error(`Shinami Gas Station rejected the request (${sponsorRes.status}): ${errorText}. Please verify your EXPO_PUBLIC_SHINAMI_GAS_KEY in Vercel is correct.`);
+  }
 
   const sponsorData = await sponsorRes.json();
   if (sponsorData.error) {
