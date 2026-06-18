@@ -1044,7 +1044,6 @@ export default function MorningBriefingScreen() {
           const baseProfile = entryToProfile(entry, scout);
 
           if (!myScout) {
-            passedLog.push({ name: baseProfile.name, score: baseProfile.compatibility, scoutRef: entry.scout_ref });
             return { entry, scout, baseProfile, report: null as any, reportRef: null };
           }
 
