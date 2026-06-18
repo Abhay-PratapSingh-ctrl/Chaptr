@@ -1,7 +1,8 @@
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
 import { executeSponsoredZkLogin } from '@/utils/shinamiSponsor';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
-import { generateNonce, generateRandomness, getZkLoginSignature } from '@mysten/sui/zklogin';
+import { generateNonce, generateRandomness, getZkLoginSignature, getExtendedEphemeralPublicKey, genAddressSeed } from '@mysten/sui/zklogin';
+import { jwtDecode } from 'jwt-decode';
 import { toBase64 } from '@mysten/sui/utils';
 import { Platform } from 'react-native';
 import { Transaction } from '@mysten/sui/transactions';
@@ -172,27 +173,62 @@ export const fetchZkProof = async (
     },
   });
 
-  const zkProof = await enokiRequest<{
-    proofPoints: unknown;
-    issBase64Details: unknown;
-    headerBase64: string;
-    addressSeed: string;
-  }>('/zklogin/zkp', {
-    method: 'POST',
-    headers: {
-      'zklogin-jwt': jwt,
-    },
-    body: {
-      network: SUI_NETWORK,
-      ephemeralPublicKey,
-      maxEpoch,
-      randomness: randomness.toString(),
-    },
-  });
+  let zkProof: any;
+  let addressSeed: string;
+
+  try {
+    zkProof = await enokiRequest<{
+      proofPoints: unknown;
+      issBase64Details: unknown;
+      headerBase64: string;
+      addressSeed: string;
+    }>('/zklogin/zkp', {
+      method: 'POST',
+      headers: {
+        'zklogin-jwt': jwt,
+      },
+      body: {
+        network: SUI_NETWORK,
+        ephemeralPublicKey,
+        maxEpoch,
+        randomness: randomness.toString(),
+      },
+    });
+    addressSeed = zkProof.addressSeed;
+  } catch (e: any) {
+    if (e.message?.includes('429')) {
+      console.warn('Enoki rate limit hit. Falling back to public Mysten prover...');
+      
+      const publicProverRes = await fetch('https://prover-dev.mystenlabs.com/v1', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jwt,
+          extendedEphemeralPublicKey: getExtendedEphemeralPublicKey(ephemeralKeyPair.getPublicKey()),
+          maxEpoch: maxEpoch.toString(),
+          jwtRandomness: randomness.toString(),
+          salt: user.salt,
+          keyClaimName: 'sub'
+        })
+      });
+
+      if (!publicProverRes.ok) {
+        throw new Error('Public prover fallback failed: ' + await publicProverRes.text());
+      }
+
+      zkProof = await publicProverRes.json();
+      
+      const decoded = jwtDecode<any>(jwt);
+      const aud = Array.isArray(decoded.aud) ? decoded.aud[0] : decoded.aud;
+      addressSeed = genAddressSeed(BigInt(user.salt), 'sub', decoded.sub, aud).toString();
+    } else {
+      throw e;
+    }
+  }
 
   const payload = {
     zkProof,
-    addressSeed: zkProof.addressSeed,
+    addressSeed,
     userSalt: user.salt,
     userAddress: user.address,
   };
