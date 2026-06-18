@@ -1274,6 +1274,12 @@ export default function MorningBriefingScreen() {
             setHumanMatches(freshMatches);
             setActiveProposal(null);
             twinConsumedByAccept = true;
+
+            // Instantly teleport the user into the chat room with their new match!
+            const newMatch = freshMatches.find(m => m.participantAddress.toLowerCase() === autoAcceptResult.matchOwner?.toLowerCase());
+            if (newMatch) {
+              router.push({ pathname: '/human-chat/[id]', params: { id: newMatch.matchId ?? newMatch.proposalId, name: newMatch.participantName } } as any);
+            }
           }
         } catch (jwtErr) {
           setIsAwaitingAuth(false);

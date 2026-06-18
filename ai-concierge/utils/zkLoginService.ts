@@ -195,6 +195,14 @@ export const fetchZkProof = async (
 export const getJwtForTransaction = async (): Promise<string> => {
   if (!GOOGLE_CLIENT_ID) throw new Error('Missing EXPO_PUBLIC_GOOGLE_CLIENT_ID');
 
+  const now = Date.now();
+  const cachedJwt = await storage.getItem('chaptr_cached_jwt');
+  const cachedExpiry = await storage.getItem('chaptr_cached_jwt_expires_at');
+  
+  if (cachedJwt && cachedExpiry && now < Number(cachedExpiry)) {
+    return cachedJwt;
+  }
+
   const { nonce } = await setupZkLoginParams();
   const redirectUri = AuthSession.makeRedirectUri();
 
@@ -203,7 +211,7 @@ export const getJwtForTransaction = async (): Promise<string> => {
     responseType: AuthSession.ResponseType.IdToken,
     scopes: ['openid', 'email', 'profile'],
     redirectUri,
-    extraParams: { nonce, prompt: 'select_account' },
+    extraParams: { nonce }, // Removed prompt: 'select_account' so it can auto-login silently
     usePKCE: false,
   });
 
@@ -211,6 +219,10 @@ export const getJwtForTransaction = async (): Promise<string> => {
 
   if (result.type !== 'success') throw new Error('Google sign-in was cancelled');
   if (!result.params.id_token) throw new Error('No id_token in Google response');
+
+  await storage.setItem('chaptr_cached_jwt', result.params.id_token);
+  // Cache for 50 minutes (JWTs expire in 60 mins)
+  await storage.setItem('chaptr_cached_jwt_expires_at', (now + 50 * 60 * 1000).toString());
 
   return result.params.id_token;
 };
