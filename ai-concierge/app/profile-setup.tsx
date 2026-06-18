@@ -330,9 +330,20 @@ export default function ProfileSetupScreen() {
       ],
     });
 
-    const result = await executeSponsoredZkLogin(
-      tx, userAddress, ephemeralKeyPair, zkProof, addressSeed, maxEpoch, suiClient
-    );
+    const txBytesUint8 = await tx.build({ client: suiClient });
+    const { signature: userSignature } = await ephemeralKeyPair.signTransaction(txBytesUint8);
+
+    const zkSignature = getZkLoginSignature({
+      inputs: { ...zkProof, addressSeed },
+      maxEpoch,
+      userSignature,
+    });
+
+    const result = await suiClient.executeTransactionBlock({
+      transactionBlock: txBytesUint8,
+      signature: zkSignature,
+      options: { showEffects: true, showEvents: true, showObjectChanges: true },
+    });
 
     const objectChanges = (result as any).objectChanges;
     const twinObjectId = extractCreatedTwinId(objectChanges);
