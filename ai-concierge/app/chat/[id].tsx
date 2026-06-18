@@ -29,7 +29,7 @@ import {
   type ScoutCapsule,
 } from '@/utils/twinMemory';
 import { buildProposeMatchTx } from '@/utils/suiTransactions';
-import { getJwtForTransaction, setupZkLoginParams } from '@/utils/zkLoginService';
+import { getJwtForTransaction, setupZkLoginParams, loadZkLoginParams, fetchZkProof } from '@/utils/zkLoginService';
 
 WebBrowser.maybeCompleteAuthSession();
 

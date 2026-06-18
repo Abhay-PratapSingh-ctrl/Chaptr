@@ -26,9 +26,8 @@ import { getZkLoginSignature } from '@mysten/sui/zklogin';
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
 import * as AuthSession from 'expo-auth-session';
 import * as WebBrowser from 'expo-web-browser';
-import { fetchZkProof, loadZkLoginParams, setupZkLoginParams } from '@/utils/zkLoginService';
+import { fetchZkProof, loadZkLoginParams, setupZkLoginParams, getJwtForTransaction } from '@/utils/zkLoginService';
 import { buildCreateMandateTx, buildUpdateMandateTx } from '@/utils/suiTransactions';
-import { getJwtForTransaction, setupZkLoginParams } from '@/utils/zkLoginService';
 
 WebBrowser.maybeCompleteAuthSession();
 

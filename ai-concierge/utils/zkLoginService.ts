@@ -78,7 +78,7 @@ const enokiRequest = async <T>(
   return JSON.parse(text).data;
 };
 
-const getEnokiEphemeralPublicKey = (keypair: Ed25519Keypair): string => {
+export const getEnokiEphemeralPublicKey = (keypair: Ed25519Keypair): string => {
   const bytes = keypair.getPublicKey().toSuiBytes();
   const encoded = toBase64(bytes);
 

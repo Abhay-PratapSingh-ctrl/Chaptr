@@ -1298,7 +1298,7 @@ export default function MorningBriefingScreen() {
             twinConsumedByAccept = true;
 
             // Instantly teleport the user into the chat room with their new match!
-            const newMatch = freshMatches.find(m => m.participantAddress.toLowerCase() === autoAcceptResult.matchOwner?.toLowerCase());
+            const newMatch = freshMatches.find(m => m.participantOwner.toLowerCase() === autoAcceptResult.matchOwner?.toLowerCase());
             if (newMatch) {
               router.push({ pathname: '/human-chat/[id]', params: { id: newMatch.matchId ?? newMatch.proposalId, name: newMatch.participantName } } as any);
             }
@@ -1791,7 +1791,7 @@ export default function MorningBriefingScreen() {
           <View style={[styles.authBanner, { backgroundColor: 'rgba(217,74,140,0.1)', borderColor: 'rgba(217,74,140,0.3)' }]}>
             <ActivityIndicator color="#D94A8C" size="small" style={{ marginRight: 8 }} />
             <Text style={[styles.authBannerText, { color: '#D94A8C' }]}>
-              {loadingText || 'Analyzing Pool...'}
+              {loadingPhase || 'Analyzing Pool...'}
             </Text>
           </View>
         )}
