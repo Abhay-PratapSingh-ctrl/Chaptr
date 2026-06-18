@@ -1821,7 +1821,11 @@ export default function MorningBriefingScreen() {
               <Text style={styles.emptyBody}>The pool may be empty, filtered by preferences, or only contain your own Twin.</Text>
             </View>
           ) : (
-            topConnections.map((item, index) => renderProfileCard({ item, index }))
+            topConnections.map((item, index) => (
+              <View key={item.id}>
+                {renderProfileCard({ item, index })}
+              </View>
+            ))
           )}
         </View>
       </ScrollView>
@@ -1910,7 +1914,7 @@ const styles = StyleSheet.create({
   primaryButtonWrap: { height: 56, borderRadius: 20, overflow: 'hidden', shadowColor: '#D94A8C', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.35, shadowRadius: 14, elevation: 8 },
   primaryButtonGradient: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   primaryButtonText: { color: '#FFF', fontSize: 16, fontWeight: '800' },
-  container: { flex: 1, maxWidth: 620, alignSelf: 'center', width: '100%', paddingHorizontal: 16, paddingTop: 12 },
+  container: { flexGrow: 1, maxWidth: 620, alignSelf: 'center', width: '100%', paddingHorizontal: 16, paddingTop: 12 },
   headerRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16, gap: 12 },
   logoText: { color: '#FDFBF7', fontSize: 22, fontWeight: '800', fontFamily: Platform.OS === 'ios' ? 'Playfair Display' : 'serif', letterSpacing: 0.4 },
   headerActions: { flexDirection: 'row', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' },
