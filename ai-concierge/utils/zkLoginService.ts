@@ -147,6 +147,21 @@ export const fetchZkProof = async (
   maxEpoch: number,
   randomness: string | bigint,
 ) => {
+  const ZK_PROOF_CACHE_KEY = 'chaptr:zk-proof-cache';
+  const ephemeralPublicKey = getEnokiEphemeralPublicKey(ephemeralKeyPair);
+
+  const cachedStr = await storage.getItem(ZK_PROOF_CACHE_KEY);
+  if (cachedStr) {
+    try {
+      const cached = JSON.parse(cachedStr);
+      if (cached.maxEpoch === maxEpoch && cached.ephemeralPublicKey === ephemeralPublicKey) {
+        return cached.payload;
+      }
+    } catch (e) {
+      console.warn('Failed to parse cached ZK proof', e);
+    }
+  }
+
   const user = await enokiRequest<{
     salt: string;
     address: string;
@@ -169,18 +184,26 @@ export const fetchZkProof = async (
     },
     body: {
       network: SUI_NETWORK,
-      ephemeralPublicKey: getEnokiEphemeralPublicKey(ephemeralKeyPair),
+      ephemeralPublicKey,
       maxEpoch,
       randomness: randomness.toString(),
     },
   });
 
-  return {
+  const payload = {
     zkProof,
     addressSeed: zkProof.addressSeed,
     userSalt: user.salt,
     userAddress: user.address,
   };
+
+  await storage.setItem(ZK_PROOF_CACHE_KEY, JSON.stringify({
+    maxEpoch,
+    ephemeralPublicKey,
+    payload
+  }));
+
+  return payload;
 };
 
 // ─── Exported transaction helpers ─────────────────────────────────────────────
