@@ -865,6 +865,7 @@ export default function MorningBriefingScreen() {
         localScoutCapsule,
         blockedKeys,
         hiddenProfileIds,
+        outboundProposalsEventRaw,
       ] = await Promise.all([
         fetchPoolEntries(),
         AsyncStorage.getItem('chaptr:my-owner'),
@@ -874,10 +875,23 @@ export default function MorningBriefingScreen() {
         loadLocalScoutCapsule(),
         readBlockedProfileKeys(),
         readHiddenProfileIds(),
+        suiClient.queryEvents({
+          query: { MoveEventType: `${PACKAGE_ID}::matchmaker::ProposalSent` },
+          limit: 50,
+          order: 'descending',
+        }).catch(() => null),
       ]);
 
       const blockedKeySet = new Set(blockedKeys.map((key) => key.toLowerCase()));
       const hiddenProfileIdSet = new Set(hiddenProfileIds.map((id) => id.toLowerCase()));
+
+      const alreadyProposedOnChainOwners = new Set(
+        (outboundProposalsEventRaw?.data ?? [])
+          .map((e: any) => e.parsedJson ?? {})
+          .filter((p: any) => p.from?.toLowerCase() === myOwner?.toLowerCase())
+          .map((p: any) => p.to?.toLowerCase())
+          .filter(Boolean)
+      );
 
       // Build active match owners set from GLOBAL on-chain events.
       // getMatchedOwners() returns ALL owners currently in ANY active match,
@@ -1133,9 +1147,12 @@ export default function MorningBriefingScreen() {
             // if we should propose based on score, guarded by the
             // chaptr:auto-proposed key so we never double-propose.
             const isPassed = passedSet.has(entry.twin_id);
+            const isAlreadyProposedOnChain = alreadyProposedOnChainOwners.has(entry.owner.toLowerCase());
+            
             const shouldPropose =
               mandateFields.may_propose === true &&
               !isPassed &&
+              !isAlreadyProposedOnChain &&
               a2aResult.score >= minScoreToPropose;
 
             if (shouldPropose && myTwinId && mandateIdStored) {
