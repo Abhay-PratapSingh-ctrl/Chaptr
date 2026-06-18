@@ -23,6 +23,7 @@ import { getJwtForTransaction, setupZkLoginParams, fetchZkProof, getEnokiEphemer
 import { executeSponsoredZkLogin } from '@/utils/shinamiSponsor';
 import { Transaction } from '@mysten/sui/transactions';
 import { getZkLoginSignature } from '@mysten/sui/zklogin';
+import { getFaucetHost, requestSuiFromFaucetV0 } from '@mysten/sui/faucet';
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
 import {
   buildProfileMemoryFacts,
@@ -209,7 +210,19 @@ export default function ProfileSetupScreen() {
   };
 
   const autoFundIfNeeded = async (userAddress: string) => {
-    console.log('Skipping faucet since we are using Shinami gas sponsorship for', userAddress);
+    try {
+      console.log('Requesting testnet SUI from faucet for', userAddress);
+      setStatusMsg('Requesting free testnet SUI from faucet...');
+      await requestSuiFromFaucetV0({
+        host: getFaucetHost('testnet'),
+        recipient: userAddress,
+      });
+      console.log('Faucet success. Waiting 3s for network sync...');
+      await new Promise(resolve => setTimeout(resolve, 3000));
+    } catch (e) {
+      console.warn('Faucet failed:', e);
+      // Let it continue, maybe they already have SUI
+    }
   };
 
   const handleMint = async (jwt: string) => {
