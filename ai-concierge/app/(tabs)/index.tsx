@@ -1455,9 +1455,7 @@ export default function MorningBriefingScreen() {
 
   const topConnections = useMemo(
     () => {
-      const active = profiles.filter((profile) => !passedProfileIds.includes(profile.id));
-      const passed = profiles.filter((profile) => passedProfileIds.includes(profile.id));
-      return [...active, ...passed];
+      return profiles.filter((profile) => !passedProfileIds.includes(profile.id));
     },
     [profiles, passedProfileIds],
   );
