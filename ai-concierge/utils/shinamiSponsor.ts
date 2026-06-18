@@ -16,7 +16,7 @@ export const executeSponsoredZkLogin = async (
   }
 
   tx.setSender(userAddress);
-  const txBytesUint8 = await tx.build({ client });
+  const txBytesUint8 = await tx.build({ client, onlyTransactionKind: true });
   const txBytesBase64 = toBase64(txBytesUint8);
 
   const sponsorRes = await fetch(`https://api.shinami.com/gas/v1/sui_testnet?auth=${shinamiKey}`, {
