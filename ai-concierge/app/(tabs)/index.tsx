@@ -986,6 +986,9 @@ export default function MorningBriefingScreen() {
 
       const scoutedEntries: ScoutedEntry[] = [];
 
+      const passedRaw = await AsyncStorage.getItem(PASSED_PROFILES_KEY);
+      const passedSet = new Set(passedRaw ? JSON.parse(passedRaw) : []);
+
       const scoutSettled = await Promise.allSettled(
         entries.map(async (entry) => {
           // Skip self
@@ -1129,8 +1132,10 @@ export default function MorningBriefingScreen() {
             // Queue propose independently of cache status — always check
             // if we should propose based on score, guarded by the
             // chaptr:auto-proposed key so we never double-propose.
+            const isPassed = passedSet.has(entry.twin_id);
             const shouldPropose =
               mandateFields.may_propose === true &&
+              !isPassed &&
               a2aResult.score >= minScoreToPropose;
 
             if (shouldPropose && myTwinId && mandateIdStored) {
@@ -1433,7 +1438,11 @@ export default function MorningBriefingScreen() {
   );
 
   const topConnections = useMemo(
-    () => profiles.filter((profile) => !passedProfileIds.includes(profile.id)),
+    () => {
+      const active = profiles.filter((profile) => !passedProfileIds.includes(profile.id));
+      const passed = profiles.filter((profile) => passedProfileIds.includes(profile.id));
+      return [...active, ...passed];
+    },
     [profiles, passedProfileIds],
   );
 
