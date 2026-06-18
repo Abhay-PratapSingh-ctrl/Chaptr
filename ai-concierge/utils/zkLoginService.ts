@@ -192,26 +192,31 @@ export const fetchZkProof = async (
  * Prompts the user with a Google OAuth popup and returns an id_token JWT.
  * Used as the first step before any zkLogin-signed transaction.
  */
-export const getJwtForTransaction = async (): Promise<string> => {
+export const getJwtForTransaction = async (forcePrompt: boolean = false): Promise<string> => {
   if (!GOOGLE_CLIENT_ID) throw new Error('Missing EXPO_PUBLIC_GOOGLE_CLIENT_ID');
 
   const now = Date.now();
   const cachedJwt = await storage.getItem('chaptr_cached_jwt');
   const cachedExpiry = await storage.getItem('chaptr_cached_jwt_expires_at');
   
-  if (cachedJwt && cachedExpiry && now < Number(cachedExpiry)) {
+  if (!forcePrompt && cachedJwt && cachedExpiry && now < Number(cachedExpiry)) {
     return cachedJwt;
   }
 
   const { nonce } = await setupZkLoginParams();
   const redirectUri = AuthSession.makeRedirectUri();
 
+  const extraParams: any = { nonce };
+  if (forcePrompt) {
+    extraParams.prompt = 'select_account';
+  }
+
   const request = new AuthSession.AuthRequest({
     clientId: GOOGLE_CLIENT_ID,
     responseType: AuthSession.ResponseType.IdToken,
     scopes: ['openid', 'email', 'profile'],
     redirectUri,
-    extraParams: { nonce }, // Removed prompt: 'select_account' so it can auto-login silently
+    extraParams,
     usePKCE: false,
   });
 

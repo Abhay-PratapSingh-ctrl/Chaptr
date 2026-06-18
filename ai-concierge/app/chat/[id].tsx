@@ -29,11 +29,7 @@ import {
   type ScoutCapsule,
 } from '@/utils/twinMemory';
 import { buildProposeMatchTx } from '@/utils/suiTransactions';
-import {
-  fetchZkProof,
-  loadZkLoginParams,
-  setupZkLoginParams,
-} from '@/utils/zkLoginService';
+import { getJwtForTransaction, setupZkLoginParams } from '@/utils/zkLoginService';
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -181,31 +177,7 @@ const fetchScoutProfile = async (blobId: string): Promise<ScoutProfile> => {
 };
 
 const getJwtForProposal = async () => {
-  const { nonce } = await setupZkLoginParams();
-  const redirectUri = AuthSession.makeRedirectUri();
-
-  const request = new AuthSession.AuthRequest({
-    clientId: GOOGLE_CLIENT_ID,
-    responseType: AuthSession.ResponseType.IdToken,
-    scopes: ['openid', 'email', 'profile'],
-    redirectUri,
-    extraParams: { nonce, prompt: 'select_account' },
-    usePKCE: false,
-  });
-
-  const result = await request.promptAsync(discovery);
-
-  if (result.type !== 'success') {
-    throw new Error('Google sign-in was cancelled');
-  }
-
-  const idToken = result.params.id_token;
-
-  if (!idToken) {
-    throw new Error('No id_token returned');
-  }
-
-  return idToken;
+  return await getJwtForTransaction(true);
 };
 
 const buildPersonaFromScout = (scout: ScoutProfile, ownerOrId: string): Persona => {

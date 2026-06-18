@@ -16,16 +16,15 @@ import {
 import { LinearGradient } from 'expo-linear-gradient';
 import { router, useLocalSearchParams } from 'expo-router';
 import * as WebBrowser from 'expo-web-browser';
-import * as AuthSession from 'expo-auth-session';
 import * as ImagePicker from 'expo-image-picker';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { mintDigitalTwin } from '@/utils/suiTransactions';
+import { getJwtForTransaction, setupZkLoginParams, fetchZkProof, getEnokiEphemeralPublicKey } from '@/utils/zkLoginService';
 import { Transaction } from '@mysten/sui/transactions';
 import { getZkLoginSignature } from '@mysten/sui/zklogin';
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
 import {
-  fetchZkProof,
   loadZkLoginParams,
-  setupZkLoginParams,
 } from '@/utils/zkLoginService';
 import {
   buildProfileMemoryFacts,
@@ -208,25 +207,7 @@ export default function ProfileSetupScreen() {
 
     setStatusMsg('Opening Google sign-in...');
 
-    const params = await setupZkLoginParams();
-    const redirectUri = AuthSession.makeRedirectUri();
-
-    const request = new AuthSession.AuthRequest({
-      clientId: GOOGLE_CLIENT_ID,
-      responseType: AuthSession.ResponseType.IdToken,
-      scopes: ['openid', 'email', 'profile'],
-      redirectUri,
-      extraParams: { nonce: params.nonce, prompt: 'select_account' },
-      usePKCE: false,
-    });
-
-    const result = await request.promptAsync(discovery);
-    if (result.type !== 'success') throw new Error('Google sign-in was cancelled or failed');
-
-    const idToken = result.params.id_token;
-    if (!idToken) throw new Error('No id_token in Google response');
-
-    return idToken;
+    return await getJwtForTransaction(true);
   };
 
   const autoFundIfNeeded = async (userAddress: string): Promise<void> => {

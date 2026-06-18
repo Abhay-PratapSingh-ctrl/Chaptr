@@ -28,6 +28,7 @@ import * as AuthSession from 'expo-auth-session';
 import * as WebBrowser from 'expo-web-browser';
 import { fetchZkProof, loadZkLoginParams, setupZkLoginParams } from '@/utils/zkLoginService';
 import { buildCreateMandateTx, buildUpdateMandateTx } from '@/utils/suiTransactions';
+import { getJwtForTransaction, setupZkLoginParams } from '@/utils/zkLoginService';
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -35,21 +36,8 @@ const GOOGLE_CLIENT_ID = process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID || '';
 const suiClient = new SuiJsonRpcClient({ url: getJsonRpcFullnodeUrl('testnet'), network: 'testnet' });
 const discovery = { authorizationEndpoint: 'https://accounts.google.com/o/oauth2/v2/auth' };
 
-const getJwtForTransaction = async (): Promise<string> => {
-  const { nonce } = await setupZkLoginParams();
-  const redirectUri = AuthSession.makeRedirectUri();
-  const request = new AuthSession.AuthRequest({
-    clientId: GOOGLE_CLIENT_ID,
-    responseType: AuthSession.ResponseType.IdToken,
-    scopes: ['openid', 'email', 'profile'],
-    redirectUri,
-    extraParams: { nonce, prompt: 'select_account' },
-    usePKCE: false,
-  });
-  const result = await request.promptAsync(discovery);
-  if (result.type !== 'success') throw new Error('Google sign-in was cancelled');
-  if (!result.params.id_token) throw new Error('No id_token');
-  return result.params.id_token;
+const getJwtForTransactionLocal = async (): Promise<string> => {
+  return await getJwtForTransaction(true);
 };
 
 const UPDATED_SCOUT_REF_KEY = 'chaptr:my-updated-scout-ref';
@@ -173,7 +161,7 @@ const handleActivateMandate = async () => {
     const myOwner = await AsyncStorage.getItem('chaptr:my-owner');
     if (!myOwner) throw new Error('No local identity found.');
 
-    const jwt = await getJwtForTransaction();
+    const jwt = await getJwtForTransactionLocal();
 
     setMandateStatusMsg('Generating ZK proof...');
     const { ephemeralKeyPair, maxEpoch, randomness } = await loadZkLoginParams();

@@ -17,13 +17,8 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { LinearGradient } from 'expo-linear-gradient';
 import { router, type Href } from 'expo-router';
 import * as WebBrowser from 'expo-web-browser';
-import * as AuthSession from 'expo-auth-session';
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
-import {
-  fetchZkProof,
-  loadZkLoginParams,
-  setupZkLoginParams,
-} from '@/utils/zkLoginService';
+import { getJwtForTransaction, loadZkLoginParams, setupZkLoginParams, fetchZkProof, getEnokiEphemeralPublicKey } from '@/utils/zkLoginService';
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -211,33 +206,11 @@ export default function ConnectScreen() {
         throw new Error('Missing EXPO_PUBLIC_GOOGLE_CLIENT_ID');
       }
 
-      // Step 1: setup zkLogin params and run Google OAuth — identical to before
-      const { nonce } = await setupZkLoginParams();
-      const redirectUri = AuthSession.makeRedirectUri();
-
-      const request = new AuthSession.AuthRequest({
-        clientId: GOOGLE_CLIENT_ID,
-        responseType: AuthSession.ResponseType.IdToken,
-        scopes: ['openid', 'email', 'profile'],
-        redirectUri,
-        extraParams: {
-          nonce,
-          prompt: 'select_account',
-        },
-        usePKCE: false,
-      });
-
-      const result = await request.promptAsync(discovery);
-
-      if (result.type !== 'success') {
-        throw new Error('Google sign-in was cancelled');
-      }
-
-      const jwt = result.params.id_token;
-
-      if (!jwt) {
-        throw new Error('Google did not return an id_token');
-      }
+      // Step 1: setup zkLogin params and run Google OAuth
+      // We use forcePrompt: true because this is the explicit login screen.
+      // This shared function also automatically caches the JWT so future
+      // background operations won't pop up again.
+      const jwt = await getJwtForTransaction(true);
 
       // Step 2: Derive Sui address from JWT.
       // fetchZkProof is the same call used in every transaction flow.

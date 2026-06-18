@@ -24,11 +24,7 @@ import { getZkLoginSignature, generateNonce } from '@mysten/sui/zklogin';
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
 import { buildSendHumanMessageTx } from '@/utils/suiTransactions';
 import { fetchJsonFromWalrus, uploadJsonToWalrus } from '@/utils/walrusService';
-import {
-  fetchZkProof,
-  loadZkLoginParams,
-  setupZkLoginParams,
-} from '@/utils/zkLoginService';
+import { getJwtForTransaction, loadZkLoginParams, setupZkLoginParams, fetchZkProof } from '@/utils/zkLoginService';
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -118,37 +114,7 @@ const getJwtForChatAction = async () => {
     throw new Error('Missing EXPO_PUBLIC_GOOGLE_CLIENT_ID');
   }
 
-  let params;
-try {
-  params = await loadZkLoginParams();
-} catch {
-  params = await setupZkLoginParams();
-}
-const nonce = generateNonce(
-  params.ephemeralKeyPair.getPublicKey(),
-  params.maxEpoch,
-  params.randomness,
-);
-
-  const request = new AuthSession.AuthRequest({
-    clientId: GOOGLE_CLIENT_ID,
-    responseType: AuthSession.ResponseType.IdToken,
-    scopes: ['openid', 'email', 'profile'],
-    redirectUri: AuthSession.makeRedirectUri(),
-    extraParams: { nonce, prompt: 'select_account' },
-    usePKCE: false,
-  });
-
-  const result = await request.promptAsync(discovery);
-
-  if (result.type !== 'success') {
-    throw new Error('Google sign-in was cancelled');
-  }
-
-  const idToken = result.params.id_token;
-  if (!idToken) throw new Error('No id_token returned');
-
-  return idToken;
+  return await getJwtForTransaction(true);
 };
 
 const executeWithZkLoginSession = async (tx: any, session: ChatZkSession) => {

@@ -17,7 +17,7 @@ import { getZkLoginSignature, generateNonce } from '@mysten/sui/zklogin';
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
 import { buildEndMatchTx } from '@/utils/suiTransactions';
 import { writeFeedback, submitReport, writeBlockEntry } from '@/utils/safetyService';
-import { fetchZkProof, loadZkLoginParams, setupZkLoginParams } from '@/utils/zkLoginService';
+import { fetchZkProof, getJwtForTransaction, loadZkLoginParams, setupZkLoginParams } from '@/utils/zkLoginService';
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -73,40 +73,10 @@ const ACCURACY_OPTIONS = [
 
 // Gets JWT immediately on user gesture — must be called before any awaits
 const getJwtForEndMatch = async () => {
-  if (!GOOGLE_CLIENT_ID) throw new Error('Missing EXPO_PUBLIC_GOOGLE_CLIENT_ID');
-
-  // Reuse existing zk params — do NOT call setupZkLoginParams() which clears keys
-  let params;
-  try {
-    params = await loadZkLoginParams();
-  } catch {
-    params = await setupZkLoginParams();
-  }
-
-  const nonce = generateNonce(
-    params.ephemeralKeyPair.getPublicKey(),
-    params.maxEpoch,
-    params.randomness,
-  );
-
-  const redirectUri = AuthSession.makeRedirectUri();
-
-  const request = new AuthSession.AuthRequest({
-    clientId: GOOGLE_CLIENT_ID,
-    responseType: AuthSession.ResponseType.IdToken,
-    scopes: ['openid', 'email', 'profile'],
-    redirectUri,
-    extraParams: { nonce, prompt: 'select_account' },
-    usePKCE: false,
-  });
-
-  const result = await request.promptAsync(discovery);
-  if (result.type !== 'success') throw new Error('Google sign-in was cancelled');
-
-  const idToken = result.params.id_token;
-  if (!idToken) throw new Error('No id_token returned');
-
-  return idToken;
+  const getJwtForUpload = async (): Promise<string> => {
+    return await getJwtForTransaction(true);
+  };
+  return await getJwtForUpload();
 };
 
 // Accepts jwt as parameter — called after local writes so popup isn't blocked
