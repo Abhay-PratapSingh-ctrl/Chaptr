@@ -562,7 +562,36 @@ const generateScoutReport = async (myScout: ScoutProfile, candidateScout: ScoutP
     const parsed = text ? parseGeminiJson(text) : null;
     return normalizeScoutReport(parsed ?? {}, myScout, candidateScout);
   } catch (error) {
-    console.warn('Gemini scout report failed, using fallback report:', error);
+    console.warn('Gemini scout report failed:', error);
+    
+    const groqKey = process.env.EXPO_PUBLIC_GROQ_FALLBACK_API_KEY;
+    if (groqKey) {
+      try {
+        console.log('Attempting Groq fallback for scout report...');
+        const groqResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${groqKey}`,
+          },
+          body: JSON.stringify({
+            model: 'llama-3.3-70b-versatile',
+            messages: [{ role: 'user', content: prompt }],
+            temperature: 0.2,
+            max_tokens: 600,
+            response_format: { type: 'json_object' },
+          }),
+        });
+        const groqData = await groqResponse.json();
+        if (!groqResponse.ok) throw new Error(groqData?.error?.message ?? `Groq fallback failed: ${groqResponse.status}`);
+        const groqText = groqData?.choices?.[0]?.message?.content;
+        const groqParsed = groqText ? parseGeminiJson(groqText) : null;
+        return normalizeScoutReport(groqParsed ?? {}, myScout, candidateScout);
+      } catch (groqError) {
+        console.warn('Groq fallback also failed, using fallback report:', groqError);
+      }
+    }
+
     return fallbackScoutReport(myScout, candidateScout);
   }
 };
