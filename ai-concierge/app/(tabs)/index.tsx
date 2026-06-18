@@ -1566,7 +1566,7 @@ export default function MorningBriefingScreen() {
                 <View style={styles.zkBadge}><Text style={styles.zkBadgeText}>ZK</Text></View>
               </View>
               {item.location ? <Text style={styles.location}>📍 {item.location}</Text> : null}
-              <Text style={styles.bio} numberOfLines={2}>{item.bio}</Text>
+              <Text style={styles.bio} numberOfLines={isTopCard || isUnlocked ? undefined : 2}>{item.bio}</Text>
               <Text style={[styles.statusHint, humanMatch || isFocusedProfile || isUnlocked ? styles.hintGreen : styles.hintMuted]}>
                 {humanMatch ? '✦ Human match — open chat' : isFocusedProfile ? '✦ Your Twin is focused here' : isUnlocked ? '✦ Human profile unlocked' : '· Chat to unlock profile'}
               </Text>
@@ -1691,7 +1691,7 @@ export default function MorningBriefingScreen() {
 
   return (
     <SafeAreaView style={styles.root}>
-      <View style={styles.container}>
+      <ScrollView style={{ flex: 1 }} contentContainerStyle={styles.container}>
         {/* Header */}
         <View style={styles.headerRow}>
           <Text style={styles.logoText}>Chaptr.</Text>
@@ -1814,23 +1814,17 @@ export default function MorningBriefingScreen() {
 
         {error ? <Text style={styles.errorText}>{error}</Text> : null}
 
-        <FlatList
-          data={topConnections}
-          keyExtractor={(item) => item.id}
-          renderItem={renderProfileCard}
-          contentContainerStyle={styles.listContent}
-          showsVerticalScrollIndicator={false}
-          extraData={`${passedProfileIds.join(',')}-${unlockedProfileIds.join(',')}-${humanMatches.map((m) => m.matchId ?? m.proposalId).join(',')}-${activeProposal?.candidateTwinId ?? ''}-${reportFeedbackIds.join(',')}-${isWritingReportFeedback ?? ''}`}
-          ListEmptyComponent={
-            !error ? (
-              <View style={styles.emptyState}>
-                <Text style={styles.emptyTitle}>No compatible Twins yet</Text>
-                <Text style={styles.emptyBody}>The pool may be empty, filtered by preferences, or only contain your own Twin.</Text>
-              </View>
-            ) : null
-          }
-        />
-      </View>
+        <View style={styles.listContent}>
+          {topConnections.length === 0 && !error ? (
+            <View style={styles.emptyState}>
+              <Text style={styles.emptyTitle}>No compatible Twins yet</Text>
+              <Text style={styles.emptyBody}>The pool may be empty, filtered by preferences, or only contain your own Twin.</Text>
+            </View>
+          ) : (
+            topConnections.map((item, index) => renderProfileCard({ item, index }))
+          )}
+        </View>
+      </ScrollView>
 
       {/* Activity Log Modal */}
       <ActivityLogModal
