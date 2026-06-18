@@ -15,6 +15,7 @@ import * as WebBrowser from 'expo-web-browser';
 import * as AuthSession from 'expo-auth-session';
 import { getZkLoginSignature, generateNonce } from '@mysten/sui/zklogin';
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
+import { executeSponsoredZkLogin } from '@/utils/shinamiSponsor';
 import { buildEndMatchTx } from '@/utils/suiTransactions';
 import { writeFeedback, submitReport, writeBlockEntry } from '@/utils/safetyService';
 import { fetchZkProof, getJwtForTransaction, loadZkLoginParams, setupZkLoginParams } from '@/utils/zkLoginService';
@@ -94,24 +95,9 @@ const executeEndMatch = async (matchId: string, expectedOwner: string, jwt: stri
   }
 
   const tx = buildEndMatchTx(matchId);
-  tx.setSender(userAddress);
-
-  const { bytes, signature: userSignature } = await tx.sign({
-    client: suiClient,
-    signer: ephemeralKeyPair,
-  });
-
-  const zkSignature = getZkLoginSignature({
-    inputs: { ...(zkProof as any), addressSeed },
-    maxEpoch,
-    userSignature,
-  });
-
-  return suiClient.executeTransactionBlock({
-    transactionBlock: bytes,
-    signature: zkSignature,
-    options: { showEffects: true, showEvents: true, showObjectChanges: true },
-  });
+  return executeSponsoredZkLogin(
+    tx, userAddress, ephemeralKeyPair, zkProof, addressSeed, maxEpoch, suiClient
+  );
 };
 
 const cleanupEndedMatch = async (input: {

@@ -1,4 +1,5 @@
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
+import { executeSponsoredZkLogin } from '@/utils/shinamiSponsor';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { generateNonce, generateRandomness, getZkLoginSignature } from '@mysten/sui/zklogin';
 import { toBase64 } from '@mysten/sui/utils';
@@ -271,26 +272,7 @@ export const executeZkLoginTransaction = async (
     throw new Error('Selected Google account does not match this browser identity.');
   }
 
-  tx.setSender(userAddress);
-
-  const { bytes, signature: userSignature } = await tx.sign({
-    client,
-    signer: ephemeralKeyPair,
-  });
-
-  const zkSignature = getZkLoginSignature({
-    inputs: { ...(zkProof as any), addressSeed },
-    maxEpoch,
-    userSignature,
-  });
-
-  return client.executeTransactionBlock({
-    transactionBlock: bytes,
-    signature: zkSignature,
-    options: {
-      showEffects: true,
-      showEvents: true,
-      showObjectChanges: true,
-    },
-  });
+  return executeSponsoredZkLogin(
+    tx, userAddress, ephemeralKeyPair, zkProof, addressSeed, maxEpoch, client
+  );
 };

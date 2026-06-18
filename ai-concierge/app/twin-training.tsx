@@ -26,6 +26,7 @@ import { getZkLoginSignature } from '@mysten/sui/zklogin';
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
 import * as AuthSession from 'expo-auth-session';
 import * as WebBrowser from 'expo-web-browser';
+import { executeSponsoredZkLogin } from '@/utils/shinamiSponsor';
 import { fetchZkProof, loadZkLoginParams, setupZkLoginParams, getJwtForTransaction } from '@/utils/zkLoginService';
 import { buildCreateMandateTx, buildUpdateMandateTx } from '@/utils/suiTransactions';
 
@@ -180,22 +181,9 @@ const handleActivateMandate = async () => {
       ? buildUpdateMandateTx(mandateId, mayScout, mayRunA2A, mayPropose, scoreVal)
       : buildCreateMandateTx(mayScout, mayRunA2A, mayPropose, scoreVal);
 
-    tx.setSender(userAddress);
-    const { bytes, signature: userSignature } = await tx.sign({
-      client: suiClient,
-      signer: ephemeralKeyPair,
-    });
-    const zkSignature = getZkLoginSignature({
-      inputs: { ...(zkProof as any), addressSeed },
-      maxEpoch,
-      userSignature,
-    });
-
-    const result = await suiClient.executeTransactionBlock({
-      transactionBlock: bytes,
-      signature: zkSignature,
-      options: { showEffects: true, showObjectChanges: true },
-    });
+    const result = await executeSponsoredZkLogin(
+      tx, userAddress, ephemeralKeyPair, zkProof, addressSeed, maxEpoch, suiClient
+    );
 
     // Extract new mandate object ID if this was a create
     if (!mandateId) {

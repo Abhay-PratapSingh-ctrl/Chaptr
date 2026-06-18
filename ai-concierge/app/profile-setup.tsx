@@ -19,13 +19,11 @@ import * as WebBrowser from 'expo-web-browser';
 import * as ImagePicker from 'expo-image-picker';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { mintDigitalTwin } from '@/utils/suiTransactions';
-import { getJwtForTransaction, setupZkLoginParams, fetchZkProof, getEnokiEphemeralPublicKey } from '@/utils/zkLoginService';
+import { getJwtForTransaction, setupZkLoginParams, fetchZkProof, getEnokiEphemeralPublicKey, loadZkLoginParams } from '@/utils/zkLoginService';
+import { executeSponsoredZkLogin } from '@/utils/shinamiSponsor';
 import { Transaction } from '@mysten/sui/transactions';
 import { getZkLoginSignature } from '@mysten/sui/zklogin';
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
-import {
-  loadZkLoginParams,
-} from '@/utils/zkLoginService';
 import {
   buildProfileMemoryFacts,
   buildScoutCapsule,
@@ -210,39 +208,8 @@ export default function ProfileSetupScreen() {
     return await getJwtForTransaction(true);
   };
 
-  const autoFundIfNeeded = async (userAddress: string): Promise<void> => {
-    try {
-      const coins = await suiClient.getCoins({ owner: userAddress, coinType: '0x2::sui::SUI' });
-      const totalBalance = coins.data.reduce(
-        (sum: number, coin: any) => sum + Number(coin.balance), 0
-      );
-
-      if (totalBalance > 50_000_000) {
-        console.log('Already funded:', totalBalance);
-        return;
-      }
-
-      setStatusMsg('Requesting testnet SUI for gas...');
-
-      const faucetRes = await fetch('https://faucet.testnet.sui.io/v1/gas', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          FixedAmountRequest: { recipient: userAddress },
-        }),
-      });
-
-      if (!faucetRes.ok) {
-        const text = await faucetRes.text();
-        console.warn('Faucet request failed (continuing anyway):', text);
-        return;
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, 3000));
-      console.log('Faucet funded:', userAddress);
-    } catch (err) {
-      console.warn('Auto-fund failed (continuing):', err);
-    }
+  const autoFundIfNeeded = async (userAddress: string) => {
+    console.log('Skipping faucet since we are using Shinami gas sponsorship for', userAddress);
   };
 
   const handleMint = async (jwt: string) => {
@@ -363,22 +330,9 @@ export default function ProfileSetupScreen() {
       ],
     });
 
-    const { bytes, signature: userSignature } = await tx.sign({
-      client: suiClient,
-      signer: ephemeralKeyPair,
-    });
-
-    const zkSignature = getZkLoginSignature({
-      inputs: { ...(zkProof as any), addressSeed },
-      maxEpoch,
-      userSignature,
-    });
-
-    const result = await suiClient.executeTransactionBlock({
-      transactionBlock: bytes,
-      signature: zkSignature,
-      options: { showEffects: true, showObjectChanges: true },
-    });
+    const result = await executeSponsoredZkLogin(
+      tx, userAddress, ephemeralKeyPair, zkProof, addressSeed, maxEpoch, suiClient
+    );
 
     const objectChanges = (result as any).objectChanges;
     const twinObjectId = extractCreatedTwinId(objectChanges);
@@ -451,22 +405,9 @@ export default function ProfileSetupScreen() {
         ],
       });
 
-      const { bytes, signature: userSignature } = await tx.sign({
-        client: suiClient,
-        signer: ephemeralKeyPair,
-      });
-
-      const zkSignature = getZkLoginSignature({
-        inputs: { ...(zkProof as any), addressSeed },
-        maxEpoch,
-        userSignature,
-      });
-
-      const result = await suiClient.executeTransactionBlock({
-        transactionBlock: bytes,
-        signature: zkSignature,
-        options: { showEffects: true },
-      });
+      const result = await executeSponsoredZkLogin(
+        tx, userAddress, ephemeralKeyPair, zkProof, addressSeed, maxEpoch, suiClient
+      );
 
       console.log('Re-register digest:', result.digest);
       setStatusMsg('Twin re-registered in pool ✅');

@@ -29,7 +29,8 @@ import {
   type ScoutCapsule,
 } from '@/utils/twinMemory';
 import { buildProposeMatchTx } from '@/utils/suiTransactions';
-import { getJwtForTransaction, setupZkLoginParams, loadZkLoginParams, fetchZkProof } from '@/utils/zkLoginService';
+import { getJwtForTransaction, loadZkLoginParams, fetchZkProof } from '@/utils/zkLoginService';
+import { executeSponsoredZkLogin } from '@/utils/shinamiSponsor';
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -608,24 +609,9 @@ export default function ChatScreen() {
         `Focus proposal to ${persona.name}. The recipient can talk to my Twin before accepting.`,
       );
 
-      tx.setSender(userAddress);
-
-      const { bytes, signature: userSignature } = await tx.sign({
-        client: suiClient,
-        signer: ephemeralKeyPair,
-      });
-
-      const zkSignature = getZkLoginSignature({
-        inputs: { ...(zkProof as any), addressSeed },
-        maxEpoch,
-        userSignature,
-      });
-
-      const result = await suiClient.executeTransactionBlock({
-        transactionBlock: bytes,
-        signature: zkSignature,
-        options: { showEffects: true, showEvents: true, showObjectChanges: true },
-      });
+      const result = await executeSponsoredZkLogin(
+        tx, userAddress, ephemeralKeyPair, zkProof, addressSeed, maxEpoch, suiClient
+      );
 
       const proposalId = extractProposalIdFromResult(result);
 

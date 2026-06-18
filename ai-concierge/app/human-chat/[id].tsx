@@ -22,6 +22,7 @@ import * as WebBrowser from 'expo-web-browser';
 import * as AuthSession from 'expo-auth-session';
 import { getZkLoginSignature, generateNonce } from '@mysten/sui/zklogin';
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
+import { executeSponsoredZkLogin } from '@/utils/shinamiSponsor';
 import { buildSendHumanMessageTx } from '@/utils/suiTransactions';
 import { fetchJsonFromWalrus, uploadJsonToWalrus } from '@/utils/walrusService';
 import { getJwtForTransaction, loadZkLoginParams, setupZkLoginParams, fetchZkProof } from '@/utils/zkLoginService';
@@ -118,24 +119,9 @@ const getJwtForChatAction = async () => {
 };
 
 const executeWithZkLoginSession = async (tx: any, session: ChatZkSession) => {
-  tx.setSender(session.userAddress);
-
-  const { bytes, signature: userSignature } = await tx.sign({
-    client: suiClient,
-    signer: session.ephemeralKeyPair,
-  });
-
-  const zkSignature = getZkLoginSignature({
-    inputs: { ...(session.zkProof as any), addressSeed: session.addressSeed },
-    maxEpoch: session.maxEpoch,
-    userSignature,
-  });
-
-  return suiClient.executeTransactionBlock({
-    transactionBlock: bytes,
-    signature: zkSignature,
-    options: { showEffects: true, showEvents: true, showObjectChanges: true },
-  });
+  return executeSponsoredZkLogin(
+    tx, session.userAddress, session.ephemeralKeyPair, session.zkProof, session.addressSeed, session.maxEpoch, suiClient
+  );
 };
 
 const loadChainMessages = async (
