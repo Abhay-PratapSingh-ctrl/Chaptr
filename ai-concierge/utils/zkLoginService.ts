@@ -203,7 +203,19 @@ export const getJwtForTransaction = async (forcePrompt: boolean = false): Promis
     return cachedJwt;
   }
 
-  const { nonce } = await setupZkLoginParams();
+  let nonce: string;
+  try {
+    const params = await loadZkLoginParams();
+    nonce = generateNonce(
+      params.ephemeralKeyPair.getPublicKey(),
+      params.maxEpoch,
+      params.randomness,
+    );
+  } catch {
+    const params = await setupZkLoginParams();
+    nonce = params.nonce;
+  }
+
   const redirectUri = AuthSession.makeRedirectUri();
 
   const extraParams: any = { nonce };

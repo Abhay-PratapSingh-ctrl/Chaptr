@@ -1627,7 +1627,7 @@ export default function MorningBriefingScreen() {
                 <View style={styles.zkBadge}><Text style={styles.zkBadgeText}>ZK</Text></View>
               </View>
               {item.location ? <Text style={styles.location}>📍 {item.location}</Text> : null}
-              <Text style={styles.bio} numberOfLines={isTopCard || isUnlocked ? undefined : 2}>{item.bio}</Text>
+              <Text style={styles.bio}>{item.bio}</Text>
               <Text style={[styles.statusHint, humanMatch || isFocusedProfile || isUnlocked ? styles.hintGreen : styles.hintMuted]}>
                 {humanMatch ? '✦ Human match — open chat' : isFocusedProfile ? '✦ Your Twin is focused here' : isUnlocked ? '✦ Human profile unlocked' : '· Chat to unlock profile'}
               </Text>
@@ -1638,7 +1638,6 @@ export default function MorningBriefingScreen() {
             </View>
           </View>
 
-          {isTopCard && (
             <>
               <View style={styles.divider} />
               <View style={styles.reportBox}>
@@ -1714,7 +1713,6 @@ export default function MorningBriefingScreen() {
                 </TouchableOpacity>
               </View>
             </>
-          )}
         </LinearGradient>
       </Animated.View>
     );
