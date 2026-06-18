@@ -1,6 +1,8 @@
 import { fromBase64, toBase64 } from '@mysten/sui/utils';
 import { getZkLoginSignature } from '@mysten/sui/zklogin';
 
+import { Platform } from 'react-native';
+
 export const executeSponsoredZkLogin = async (
   tx: any,
   userAddress: string,
@@ -19,7 +21,15 @@ export const executeSponsoredZkLogin = async (
   const txBytesUint8 = await tx.build({ client, onlyTransactionKind: true });
   const txBytesBase64 = toBase64(txBytesUint8);
 
-  const sponsorRes = await fetch(`https://api.shinami.com/gas/v1/sui_testnet?auth=${shinamiKey}`, {
+  // Fix CORS on Vercel Web by proxying through vercel.json rewrite.
+  // Mobile devices don't have CORS, so they hit Shinami directly.
+  const isWeb = Platform.OS === 'web';
+  const isProduction = process.env.NODE_ENV === 'production';
+  const sponsorUrl = (isWeb && isProduction)
+    ? `/api/shinami-sponsor?auth=${shinamiKey}`
+    : `https://api.shinami.com/gas/v1/sui_testnet?auth=${shinamiKey}`;
+
+  const sponsorRes = await fetch(sponsorUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({

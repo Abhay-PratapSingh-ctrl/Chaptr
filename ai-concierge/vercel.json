@@ -1,0 +1,8 @@
+{
+  "rewrites": [
+    {
+      "source": "/api/shinami-sponsor",
+      "destination": "https://api.shinami.com/gas/v1/sui_testnet"
+    }
+  ]
+}
