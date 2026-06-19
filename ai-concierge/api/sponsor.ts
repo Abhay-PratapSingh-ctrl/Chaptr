@@ -16,11 +16,15 @@ export default async function handler(req, res) {
   }
 
   try {
-    const response = await fetch('https://api.shinami.com/gas/v1/sui_testnet', {
+    // Shinami's new API keys (us1_sui_...) must be passed directly in the URL path.
+    const cleanKey = SHINAMI_GAS_KEY.trim();
+    // Use the region-specific URL pattern with the key in the URL.
+    const url = `https://api.us1.shinami.com/sui/gas/v1/${cleanKey}`;
+    
+    const response = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-API-Key': SHINAMI_GAS_KEY.trim(),
       },
       body: JSON.stringify({
         jsonrpc: '2.0',
