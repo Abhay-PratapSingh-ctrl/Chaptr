@@ -20,7 +20,7 @@ export default async function handler(req, res) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-API-Key': SHINAMI_GAS_KEY,
+        'X-API-Key': SHINAMI_GAS_KEY.trim(),
       },
       body: JSON.stringify({
         jsonrpc: '2.0',
@@ -30,16 +30,24 @@ export default async function handler(req, res) {
       }),
     });
 
-    const data = await response.json();
+    let data;
+    const responseText = await response.text();
+    
+    try {
+      data = JSON.parse(responseText);
+    } catch (parseError) {
+      console.error('Shinami returned non-JSON response:', responseText);
+      return res.status(500).json({ error: `Shinami API failed: ${response.status} ${responseText}` });
+    }
 
     if (data.error) {
-      console.error('Shinami returned error:', data.error);
+      console.error('Shinami returned JSON error:', data.error);
       return res.status(500).json({ error: data.error.message || 'Failed to sponsor transaction' });
     }
 
     return res.status(200).json(data.result);
   } catch (error) {
     console.error('Sponsor error:', error);
-    return res.status(500).json({ error: 'Internal server error while sponsoring transaction' });
+    return res.status(500).json({ error: `Internal server error: ${(error as any).message}` });
   }
 }
