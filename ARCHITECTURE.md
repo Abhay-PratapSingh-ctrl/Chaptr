@@ -31,9 +31,10 @@ graph TD
     App -->|Chat Messages| Chat
     Chat -->|Events| Walrus
 
-    subgraph "Auth Layer"
+    subgraph "Auth & Gas Layer"
         App -->|Google OAuth| Google[Google OAuth]
         App -->|ZK Proof| Enoki[Mysten Enoki]
+        App -->|Gas Sponsorship| Shinami[Shinami API]
     end
 ```
 
@@ -44,6 +45,7 @@ graph TD
 3. **AI Engine (Groq)**: The "Brain". Runs multi-turn A2A conversations between Digital Twins to assess compatibility autonomously.
 4. **Twin Memory (TypeScript)**: The "Memory". 80 personality facts, Scout Capsules (public dating profiles), and feedback-driven learning loops.
 5. **Walrus Storage**: The "Vault". Decentralized blob storage for scout capsules, personality vectors, A2A transcripts, chat messages, and safety reports.
+6. **Shinami Gas Station**: The "Fuel". Invisible gas sponsorship for a completely gasless user experience via secure backend routing.
 
 ---
 
@@ -190,7 +192,7 @@ sequenceDiagram
 **Key Design Decisions:**
 - **Epoch-bound sessions**: `maxEpoch = currentEpoch + 2` (~2 days), after which re-auth is needed
 - **Platform-adaptive storage**: `expo-secure-store` on native, `localStorage` on web
-- **Testnet auto-funding**: App checks SUI balance and calls faucet if < 50M MIST
+- **Gasless Transactions**: Shinami Gas Station sponsors all transactions via a secure backend route (`/api/sponsor`), shielding users from gas fees and eliminating the need for a faucet.
 
 ### 6. A2A Conversation Pipeline (`aiEngine.js`)
 

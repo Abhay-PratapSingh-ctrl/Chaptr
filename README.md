@@ -30,9 +30,10 @@ graph TD
         App -->|Chat Messages| Walrus
     end
 
-    subgraph "Auth Infrastructure"
+    subgraph "Auth & Gas Infrastructure"
         App -->|OAuth| Google[Google OAuth]
         App -->|ZK Proof| Enoki[Mysten Enoki]
+        App -->|Gas Sponsorship| Shinami[Shinami API]
     end
 
     AI -->|Compatibility Reports| Walrus
@@ -185,6 +186,7 @@ erDiagram
 | **Smart Contracts** | Sui Move (2024.beta) | 2 packages, 4 modules, testnet deployed |
 | **AI Engine** | Groq Cloud | LLaMA 3.1 8B Instant, multi-turn A2A conversations |
 | **Authentication** | Sui zkLogin | Google OAuth + Mysten Enoki (salt + ZK prover) |
+| **Gas Sponsorship** | Shinami Gas Station | Secure backend route (`/api/sponsor`) for 100% gasless UX |
 | **Storage** | Walrus Testnet | JSON blobs (public) + XOR-encrypted vectors (private) |
 | **Local Storage** | AsyncStorage + SecureStore | 20+ cache keys + hardware-encrypted keys |
 
@@ -234,6 +236,7 @@ chaptr/
 
 - **zkLogin**: Zero-knowledge proofs ensure Google identity is never revealed on-chain
 - **Physical Escrow**: Object wrapping prevents double-proposals at the blockchain level
+- **Gasless Transactions**: All transactions sponsored by Shinami Gas Station via secure backend route
 - **Encrypted Storage**: Private personality data XOR-encrypted on Walrus; keys in hardware SecureStore
 - **Owner-Only Mutations**: All smart contract functions verify `sender == owner`
 - **Content Safety**: Block/report system with Walrus persistence and Twin training feedback loop
