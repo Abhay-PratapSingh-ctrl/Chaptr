@@ -498,6 +498,50 @@ export default function ChatScreen() {
       return cleaned;
     } catch (error) {
       console.error('Gemini API Error:', error);
+      
+      const groqKey = process.env.EXPO_PUBLIC_GROQ_FALLBACK_API_KEY || process.env.EXPO_PUBLIC_GROQ_API_KEY;
+      if (groqKey && persona) {
+        try {
+          console.log('Attempting Groq fallback for chat...');
+          
+          const firstUserIndex = chatHistory.findIndex((msg) => msg.sender === 'user');
+          const apiHistory = firstUserIndex === -1 ? [] : chatHistory.slice(firstUserIndex);
+          
+          const groqMessages = [
+            { role: 'system', content: persona.systemPrompt },
+            ...apiHistory.map(msg => ({
+              role: msg.sender === 'user' ? 'user' : 'assistant',
+              content: msg.text
+            }))
+          ];
+
+          const groqResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${groqKey}`,
+            },
+            body: JSON.stringify({
+              model: 'llama-3.1-8b-instant',
+              messages: groqMessages,
+              temperature: 0.85,
+              max_tokens: 320,
+            }),
+          });
+          
+          const groqData = await groqResponse.json();
+          if (!groqResponse.ok) throw new Error(groqData?.error?.message ?? `Groq fallback failed: ${groqResponse.status}`);
+          
+          const groqText = groqData?.choices?.[0]?.message?.content;
+          if (groqText) {
+            const cleanedGroq = groqText.trim();
+            if (cleanedGroq.length >= 40) return cleanedGroq;
+          }
+        } catch (groqError) {
+          console.warn('Groq fallback also failed:', groqError);
+        }
+      }
+
       return 'I had trouble reading the signal for a second. Ask me that again?';
     }
   };
