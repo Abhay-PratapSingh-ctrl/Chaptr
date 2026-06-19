@@ -1151,7 +1151,6 @@ export default function MorningBriefingScreen() {
             const shouldPropose =
               mandateFields.may_propose === true &&
               !isPassed &&
-              !isAlreadyProposedOnChain &&
               a2aResult.score >= minScoreToPropose;
 
             if (shouldPropose && myTwinId && mandateIdStored) {
